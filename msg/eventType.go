@@ -48,3 +48,13 @@ func (this *EventTopic) Equal(et EventType) bool {
 func (this *EventTopic) GetEventType() EventType {
 	return this.et
 }
+
+func (this *EventTopic) FindStringSubmatch(et EventType) []string {
+
+	if this.isRegexp {
+		return this.reg.FindStringSubmatch(string(et))
+	} else {
+		return []string{string(et)}
+	}
+
+}

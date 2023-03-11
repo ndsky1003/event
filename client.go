@@ -269,6 +269,7 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 	} else {
 		for tp, method := range doMethods {
 			args := this.parse(req.Bytes, int(req.BodyCount), method)
+			args = append([]reflect.Value{reflect.ValueOf(tp.FindStringSubmatch(et))}, args...)
 			returnValues := method.function.Call(args)
 			errInter := returnValues[0].Interface()
 			if errInter != nil {
@@ -295,8 +296,11 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 }
 
 var errType = reflect.TypeOf((*error)(nil)).Elem()
+var sliceType = reflect.TypeOf((*[]string)(nil)).Elem()
 
 // 监听事件
+// first param is trigger EventType
+// if t is reg , first param is the value of reg.FindStringSubmatch(et)
 func (this *client) On(t msg.EventType, Func any) error {
 	if t == "" {
 		return errors.New("event type must not empty")
@@ -312,8 +316,15 @@ func (this *client) On(t msg.EventType, Func any) error {
 		return errors.New("return param must error")
 	}
 	inCount := rt.NumIn()
+	if inCount < 1 {
+		return errors.New("parm must have one and is a []string")
+	}
+	if rt.In(0) != sliceType {
+		return errors.New("On Action first param must []string")
+	}
+	inCount = inCount - 1
 	var argsType = make([]*argType, 0, inCount)
-	for i := 0; i < inCount; i++ {
+	for i := 1; i < inCount+1; i++ {
 		at := rt.In(i)
 		argsType = append(argsType, &argType{isPointer: at.Kind() == reflect.Pointer, at: at})
 	}
@@ -381,6 +392,7 @@ func (this *client) emit(t msg.MsgType, eventType msg.EventType, args ...any) er
 	return call.Error
 }
 
+// 触发事件
 func (this *client) Emit(eventType msg.EventType, args ...any) error {
 	return this.emit(msg.MsgType_req, eventType, args...)
 }
