@@ -176,9 +176,9 @@ func (this *client) StopHeart() {
 
 }
 
-func (this *client) printCall() {
+func (this *client) PrintCall() {
 	for index, msg := range this.pending {
-		logrus.Info("index:%d,msg:%+v\n", index, *msg)
+		logrus.Infof("index:%d,msg:%+v\n", index, msg.Error)
 	}
 }
 
@@ -194,11 +194,11 @@ func (this *client) input(codec codec.Codec) {
 		switch gotMsg.T {
 		case msg.MsgType_ping:
 		case msg.MsgType_req:
-			logrus.Infof("client receive:%+v", gotMsg)
+			fmt.Printf("client receive:%+v\n", gotMsg)
 			go this.call(codec, &gotMsg)
 		case msg.MsgType_res, msg.MsgType_on, msg.MsgType_pong:
 			if gotMsg.T != msg.MsgType_pong {
-				logrus.Infof("client receive:%+v", gotMsg)
+				fmt.Printf("client receive:%+v\n", gotMsg)
 			}
 			seq := gotMsg.LocalSeq
 			this.mutex.Lock()
@@ -421,6 +421,7 @@ func (this *client) send(call *msg.Call) {
 	call.Msg.LocalSeq = seq
 	this.writeMutex.Lock()
 	err := codec.Write(call.Msg)
+	logrus.Infof("send:%+v", call.Msg)
 	this.writeMutex.Unlock()
 	if err != nil {
 		this.mutex.Lock()
@@ -434,4 +435,8 @@ func (this *client) send(call *msg.Call) {
 			call.Do()
 		}
 	}
+}
+
+func (this *client) Seq() uint64 {
+	return this.seq
 }

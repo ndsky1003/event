@@ -225,6 +225,7 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 	reqSeq := msg.ServerSeq
 	this.mutex.Lock()
 	reqMeta, ok := this.reqMetas[reqSeq]
+	fmt.Printf("reqMeta:%+v\n", reqMeta)
 	if ok {
 		reqMeta.reqCount--
 		leftCount := reqMeta.reqCount
@@ -237,6 +238,7 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 			if reqMeta.existErr {
 				msg.Error = strings.Join(reqMeta.errs, ";")
 			}
+			fmt.Printf("reqMeta real:%+v\n", reqMeta)
 			err := this.write(reqMeta.senderID, msg)
 			this.mutex.Lock()
 			if err != nil {
@@ -307,7 +309,7 @@ func (this *service) serve() {
 				retFrame := &msg.Msg{T: msg.MsgType_pong, ServerSeq: frame.ServerSeq, LocalSeq: frame.LocalSeq}
 				err = this.write(retFrame)
 			case msg.MsgType_on, msg.MsgType_req, msg.MsgType_res:
-				logrus.Infof("receive msg:%+v\n", frame)
+				fmt.Printf("receive msg:%+v\n", frame)
 				go this.server.handle(this.id, this.name, &frame)
 			default:
 				logrus.Infof("invalid msg:%+v", frame)
