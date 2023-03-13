@@ -100,7 +100,7 @@ func (this *client) keepAlive() {
 				continue
 			} else {
 				if err := this.serve(codec); err != nil {
-					logrus.Error(err)
+					logrus.Error("server:", err)
 				}
 				continue
 			}
@@ -263,13 +263,14 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 		}
 	}
 	this.mutex.RUnlock()
-
 	if !isHasFunc {
 		err = fmt.Errorf("has no func to do:%v", req.EventType)
 	} else {
 		for tp, method := range doMethods {
 			args := this.parse(req.Bytes, int(req.BodyCount), method)
-			args = append([]reflect.Value{reflect.ValueOf(tp.FindStringSubmatch(et))}, args...)
+			if tp.IsRegexp {
+				args = append([]reflect.Value{reflect.ValueOf(tp.FindStringSubmatch(et))}, args...)
+			}
 			returnValues := method.function.Call(args)
 			errInter := returnValues[0].Interface()
 			if errInter != nil {
@@ -290,7 +291,7 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 	err = codec.Write(res)
 	this.writeMutex.Unlock()
 	if err != nil {
-		logrus.Error(err)
+		logrus.Error("ttt:", err)
 		this.stop(err)
 	}
 }
@@ -299,8 +300,7 @@ var errType = reflect.TypeOf((*error)(nil)).Elem()
 var sliceType = reflect.TypeOf((*[]string)(nil)).Elem()
 
 // 监听事件
-// first param is trigger EventType
-// if t is reg , first param is the value of reg.FindStringSubmatch(et)
+// if t is reg , first param must the value of reg.FindStringSubmatch(et)
 func (this *client) On(t msg.EventType, Func any) error {
 	if t == "" {
 		return errors.New("event type must not empty")
@@ -316,19 +316,25 @@ func (this *client) On(t msg.EventType, Func any) error {
 		return errors.New("return param must error")
 	}
 	inCount := rt.NumIn()
-	if inCount < 1 {
-		return errors.New("parm must have one and is a []string")
+	length := inCount
+	newtp := msg.NewEventTopic(t)
+	var inStart int
+	if newtp.IsRegexp {
+		if inCount < 1 {
+			return errors.New("parm must have one and is a []string")
+		}
+		if rt.In(0) != sliceType {
+			return errors.New("On Action first param must []string")
+		}
+		inStart = 1
+		inCount = inCount - 1
 	}
-	if rt.In(0) != sliceType {
-		return errors.New("On Action first param must []string")
-	}
-	inCount = inCount - 1
+
 	var argsType = make([]*argType, 0, inCount)
-	for i := 1; i < inCount+1; i++ {
+	for i := inStart; i < length; i++ {
 		at := rt.In(i)
 		argsType = append(argsType, &argType{isPointer: at.Kind() == reflect.Pointer, at: at})
 	}
-
 	rv := reflect.ValueOf(Func)
 	mType := &method{
 		function: rv,
@@ -357,7 +363,7 @@ func (this *client) On(t msg.EventType, Func any) error {
 	return this.emit(msg.MsgType_on, t)
 }
 
-func (this *client) EmitAsync(t msg.MsgType, eventType msg.EventType, args ...any) (call *msg.Call) {
+func (this *client) EmitAsync(eventType msg.EventType, args ...any) (call *msg.Call) {
 	return this.emit_async(msg.MsgType_req, eventType, args...)
 }
 
@@ -424,6 +430,7 @@ func (this *client) send(call *msg.Call) {
 		if call != nil {
 			err = fmt.Errorf("current:%v,err:%w", err, errLocalWrite)
 			call.Error = err
+			fmt.Println("dddd", call.Error)
 			call.Do()
 		}
 	}

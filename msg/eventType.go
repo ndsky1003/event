@@ -17,7 +17,7 @@ func (this EventType) isRegexp() bool {
 type EventTopic struct {
 	et       EventType
 	reg      *regexp.Regexp
-	isRegexp bool
+	IsRegexp bool
 }
 
 func NewEventTopic(et EventType) *EventTopic {
@@ -28,13 +28,13 @@ func NewEventTopic(et EventType) *EventTopic {
 	length := len(str)
 	if et.isRegexp() {
 		s.reg = regexp.MustCompile(str[1 : length-1])
-		s.isRegexp = true
+		s.IsRegexp = true
 	}
 	return s
 }
 
 func (this *EventTopic) Match(et EventType) bool {
-	if this.isRegexp {
+	if this.IsRegexp {
 		return this.reg.MatchString(string(et))
 	} else {
 		return this.et == et
@@ -51,7 +51,7 @@ func (this *EventTopic) GetEventType() EventType {
 
 func (this *EventTopic) FindStringSubmatch(et EventType) []string {
 
-	if this.isRegexp {
+	if this.IsRegexp {
 		return this.reg.FindStringSubmatch(string(et))
 	} else {
 		return []string{string(et)}
