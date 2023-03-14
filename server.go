@@ -28,14 +28,14 @@ type server struct {
 }
 
 type serverReqMeta struct {
-	senderID uint64
-	reqSeq   uint64
-	reqCount uint64
-	existErr bool
-	errs     []string
-	Time     time.Time
+	reqServerID    uint64
+	serverReqSeq   uint64
+	serverReqCount uint64
+	existErr       bool
+	errs           []string
+	Time           time.Time
 	//clien info
-	localSeq uint64
+	clientSeq uint64
 	msg.EventType
 }
 
@@ -99,15 +99,15 @@ func (this *server) checkTimeOut() {
 			if time.Now().Sub(reqMeta.Time) > this.reqTimeOut*time.Second { //
 				gotMsg := &msg.Msg{
 					T:         msg.MsgType_res,
-					ServerSeq: reqMeta.reqSeq,
-					LocalSeq:  reqMeta.localSeq,
+					ServerSeq: reqMeta.serverReqSeq,
+					ClientSeq: reqMeta.clientSeq,
 					EventType: reqMeta.EventType,
 					Error:     errTimeout.Error(),
 				}
 				logrus.Errorf("remove req:%+v", gotMsg)
-				delete(this.reqMetas, reqMeta.reqSeq)
-				if err := this.write(reqMeta.senderID, gotMsg); err != nil {
-					this.close(reqMeta.senderID)
+				delete(this.reqMetas, reqMeta.serverReqSeq)
+				if err := this.write(reqMeta.reqServerID, gotMsg); err != nil {
+					this.close(reqMeta.reqServerID)
 				}
 			}
 
@@ -169,14 +169,21 @@ func (this *server) req(serviceID uint64, frame *msg.Msg) {
 		return
 	}
 	this.mutex.Lock()
-	reqSeq := this.reqSeq
-	reqSeq = incSeqID(reqSeq)
-	this.reqSeq = reqSeq
-	frame.ServerSeq = reqSeq
+	serverSeq := this.reqSeq
+	serverSeq = incSeqID(serverSeq)
+	this.reqSeq = serverSeq
+	frame.ServerSeq = serverSeq
+	reqMeta := &serverReqMeta{
+		reqServerID:    serviceID,
+		clientSeq:      frame.ClientSeq,
+		serverReqSeq:   serverSeq,
+		serverReqCount: 0,
+		Time:           time.Now(),
+	}
+	this.reqMetas[serverSeq] = reqMeta
 	this.mutex.Unlock()
 	this.mutex.RLock()
 	var isDone bool
-	var reqCount uint64
 	var needDeleteServiceID []uint64
 	var hasSendServiceID = map[uint64]struct{}{}
 	for tp, v := range this.monitor {
@@ -186,8 +193,9 @@ func (this *server) req(serviceID uint64, frame *msg.Msg) {
 					if err := this.write(sid, frame); err == nil {
 						hasSendServiceID[sid] = struct{}{}
 						isDone = true
-						reqCount++
+						reqMeta.serverReqCount++
 					} else {
+						reqMeta.serverReqCount--
 						needDeleteServiceID = append(needDeleteServiceID, sid)
 					}
 				}
@@ -203,21 +211,22 @@ func (this *server) req(serviceID uint64, frame *msg.Msg) {
 		}
 	}
 	this.mutex.RUnlock()
-
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	for _, sid := range needDeleteServiceID {
 		this.close(sid)
 	}
-	if isDone {
-		reqMeta := &serverReqMeta{
-			senderID: serviceID,
-			localSeq: frame.LocalSeq,
-			reqSeq:   reqSeq,
-			reqCount: reqCount,
-			Time:     time.Now(),
+	if isDone && reqMeta.serverReqCount == 0 { //接收比较快
+		res := &msg.Msg{
+			T:         msg.MsgType_res,
+			ServerSeq: serverSeq,
+			ClientSeq: frame.ClientSeq,
+			EventType: frame.EventType,
 		}
-		this.reqMetas[reqSeq] = reqMeta
+		if reqMeta.existErr {
+			res.Error = strings.Join(reqMeta.errs, ";")
+		}
+		this.write(reqMeta.reqServerID, res)
 	}
 }
 
@@ -227,8 +236,8 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 	reqMeta, ok := this.reqMetas[reqSeq]
 	fmt.Printf("reqMeta:%+v\n", reqMeta)
 	if ok {
-		reqMeta.reqCount--
-		leftCount := reqMeta.reqCount
+		reqMeta.serverReqCount--
+		leftCount := reqMeta.serverReqCount
 		if msg.Error != "" {
 			reqMeta.existErr = true
 			reqMeta.errs = append(reqMeta.errs, fmt.Sprintf("Name:【%s】,Err:【%s】", serviceName, msg.Error))
@@ -239,10 +248,10 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 				msg.Error = strings.Join(reqMeta.errs, ";")
 			}
 			fmt.Printf("reqMeta real:%+v\n", reqMeta)
-			err := this.write(reqMeta.senderID, msg)
+			err := this.write(reqMeta.reqServerID, msg)
 			this.mutex.Lock()
 			if err != nil {
-				logrus.Error("res senderID:%d,msg:%+v", reqMeta.senderID, msg)
+				logrus.Error("res senderID:%d,msg:%+v", reqMeta.reqServerID, msg)
 				this.close(serviceID)
 			}
 			delete(this.reqMetas, reqSeq)
@@ -306,7 +315,7 @@ func (this *service) serve() {
 			}
 			switch frame.T {
 			case msg.MsgType_ping:
-				retFrame := &msg.Msg{T: msg.MsgType_pong, ServerSeq: frame.ServerSeq, LocalSeq: frame.LocalSeq}
+				retFrame := &msg.Msg{T: msg.MsgType_pong, ServerSeq: frame.ServerSeq, ClientSeq: frame.ClientSeq}
 				err = this.write(retFrame)
 			case msg.MsgType_on, msg.MsgType_req, msg.MsgType_res:
 				fmt.Printf("receive msg:%+v\n", frame)

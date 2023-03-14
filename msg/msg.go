@@ -41,7 +41,7 @@ func (this MsgType) String() string {
 type Msg struct {
 	T         MsgType
 	ServerSeq uint64 //服务器请求的序号 ,响应的时候用
-	LocalSeq  uint64 //本地请求序号
+	ClientSeq uint64 //本地请求序号
 	Name      string
 	EventType
 	BodyCount int8 // 超过这个数就是自讨苦吃
@@ -53,7 +53,7 @@ func (this *Msg) String() string {
 	if this == nil {
 		return ""
 	}
-	return fmt.Sprintf("Msg:T:%v,ServerSeq:%d,LocalSeq:%d,Name:%s,EventType:%v,BodyCount:%d,Error:%v", this.T, this.ServerSeq, this.LocalSeq, this.Name, this.EventType, this.BodyCount, this.Error)
+	return fmt.Sprintf("Msg:T:%v,ServerSeq:%d,ClientSeq:%d,Name:%s,EventType:%v,BodyCount:%d,Error:%v", this.T, this.ServerSeq, this.ClientSeq, this.Name, this.EventType, this.BodyCount, this.Error)
 }
 
 type Call struct {

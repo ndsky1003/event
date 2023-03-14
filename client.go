@@ -200,7 +200,7 @@ func (this *client) input(codec codec.Codec) {
 			if gotMsg.T != msg.MsgType_pong {
 				fmt.Printf("client receive:%+v\n", gotMsg)
 			}
-			seq := gotMsg.LocalSeq
+			seq := gotMsg.ClientSeq
 			this.mutex.Lock()
 			call := this.pending[seq]
 			delete(this.pending, seq)
@@ -247,7 +247,7 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 	res := &msg.Msg{
 		T:         msg.MsgType_res,
 		ServerSeq: req.ServerSeq,
-		LocalSeq:  req.LocalSeq,
+		ClientSeq: req.ClientSeq,
 		EventType: et,
 	}
 	var err error
@@ -418,7 +418,7 @@ func (this *client) send(call *msg.Call) {
 	this.pending[seq] = call
 	this.seq = seq
 	this.mutex.Unlock()
-	call.Msg.LocalSeq = seq
+	call.Msg.ClientSeq = seq
 	this.writeMutex.Lock()
 	err := codec.Write(call.Msg)
 	logrus.Infof("send:%+v", call.Msg)
