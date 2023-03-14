@@ -194,11 +194,11 @@ func (this *client) input(codec codec.Codec) {
 		switch gotMsg.T {
 		case msg.MsgType_ping:
 		case msg.MsgType_req:
-			fmt.Printf("client receive:%+v\n", gotMsg)
+			//fmt.Printf("client receive:%+v\n", gotMsg)
 			go this.call(codec, &gotMsg)
 		case msg.MsgType_res, msg.MsgType_on, msg.MsgType_pong:
 			if gotMsg.T != msg.MsgType_pong {
-				fmt.Printf("client receive:%+v\n", gotMsg)
+				//fmt.Printf("client receive:%+v\n", gotMsg)
 			}
 			seq := gotMsg.ClientSeq
 			this.mutex.Lock()
@@ -291,7 +291,6 @@ func (this *client) call(codec codec.Codec, req *msg.Msg) {
 	err = codec.Write(res)
 	this.writeMutex.Unlock()
 	if err != nil {
-		logrus.Error("ttt:", err)
 		this.stop(err)
 	}
 }
@@ -421,7 +420,6 @@ func (this *client) send(call *msg.Call) {
 	call.Msg.ClientSeq = seq
 	this.writeMutex.Lock()
 	err := codec.Write(call.Msg)
-	logrus.Infof("send:%+v", call.Msg)
 	this.writeMutex.Unlock()
 	if err != nil {
 		this.mutex.Lock()
@@ -431,7 +429,6 @@ func (this *client) send(call *msg.Call) {
 		if call != nil {
 			err = fmt.Errorf("current:%v,err:%w", err, errLocalWrite)
 			call.Error = err
-			fmt.Println("dddd", call.Error)
 			call.Do()
 		}
 	}

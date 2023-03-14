@@ -104,7 +104,6 @@ func (this *server) checkTimeOut() {
 					EventType: reqMeta.EventType,
 					Error:     errTimeout.Error(),
 				}
-				logrus.Errorf("remove req:%+v", gotMsg)
 				delete(this.reqMetas, reqMeta.serverReqSeq)
 				if err := this.write(reqMeta.reqServerID, gotMsg); err != nil {
 					this.close(reqMeta.reqServerID)
@@ -234,7 +233,6 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 	reqSeq := msg.ServerSeq
 	this.mutex.Lock()
 	reqMeta, ok := this.reqMetas[reqSeq]
-	fmt.Printf("reqMeta:%+v\n", reqMeta)
 	if ok {
 		reqMeta.serverReqCount--
 		leftCount := reqMeta.serverReqCount
@@ -247,7 +245,6 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 			if reqMeta.existErr {
 				msg.Error = strings.Join(reqMeta.errs, ";")
 			}
-			fmt.Printf("reqMeta real:%+v\n", reqMeta)
 			err := this.write(reqMeta.reqServerID, msg)
 			this.mutex.Lock()
 			if err != nil {
@@ -318,7 +315,6 @@ func (this *service) serve() {
 				retFrame := &msg.Msg{T: msg.MsgType_pong, ServerSeq: frame.ServerSeq, ClientSeq: frame.ClientSeq}
 				err = this.write(retFrame)
 			case msg.MsgType_on, msg.MsgType_req, msg.MsgType_res:
-				fmt.Printf("receive msg:%+v\n", frame)
 				go this.server.handle(this.id, this.name, &frame)
 			default:
 				logrus.Infof("invalid msg:%+v", frame)
