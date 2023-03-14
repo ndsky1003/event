@@ -60,10 +60,28 @@ func NewServer(opts ...*options.ServerOptions) *server {
 	return c
 }
 
+// addrs ["192.168.0.1","192.168.0.2"]
+// port 8080
+func (this *server) Listens(addrs []string, port int) {
+	for i := len(addrs) - 1; i >= 0; i-- {
+		addr := addrs[i]
+		listenAddr := fmt.Sprintf("%v:%v", addr, port)
+		if i != 0 {
+			go this.listen(listenAddr)
+		} else {
+			this.listen(listenAddr)
+		}
+	}
+}
+
 //url:port
-func (this *server) Listen(url string) error {
+func (this *server) Listen(url string) {
+	this.listen(url)
+}
+
+func (this *server) listen(url string) {
 	if this == nil {
-		return errors.New("server is nil")
+		panic("server is nil")
 	}
 	listen, err := net.Listen("tcp", url)
 	if err != nil {
