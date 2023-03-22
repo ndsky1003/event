@@ -26,7 +26,7 @@ func (this ServerError) Error() string {
 // 出现这个错的话就要尝试重新建立连接
 var errLocalWrite = errors.New("local Write err")
 
-type client struct {
+type Client struct {
 	name          string
 	url           string
 	writeMutex    sync.Mutex   // 保证流的正确性
@@ -42,8 +42,8 @@ type client struct {
 	connecting    bool          // client is connecting
 }
 
-func Dial(url string, opts ...*options.ClientOptions) *client {
-	c := &client{
+func Dial(url string, opts ...*options.ClientOptions) *Client {
+	c := &Client{
 		url:           url,
 		events:        make(map[*msg.EventTopic][]*method),
 		pending:       make(map[uint64]*msg.Call),
@@ -78,13 +78,13 @@ func Dial(url string, opts ...*options.ClientOptions) *client {
 	return c
 }
 
-func (this *client) getConnecting() bool {
+func (this *Client) getConnecting() bool {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	return this.connecting
 }
 
-func (this *client) keepAlive() {
+func (this *Client) keepAlive() {
 	for {
 		if !this.getConnecting() {
 			conn, err := net.Dial("tcp", this.url)
@@ -123,7 +123,7 @@ func (this *client) keepAlive() {
 	}
 }
 
-func (this *client) serve(codec codec.Codec) (err error) {
+func (this *Client) serve(codec codec.Codec) (err error) {
 	this.mutex.Lock()
 	defer func() {
 		if err != nil {
@@ -152,7 +152,7 @@ func (this *client) serve(codec codec.Codec) (err error) {
 	return
 }
 
-func (this *client) stop(err error) {
+func (this *Client) stop(err error) {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	for _, call := range this.pending {
@@ -169,20 +169,20 @@ func (this *client) stop(err error) {
 	this.connecting = false
 }
 
-func (this *client) StopHeart() {
+func (this *Client) StopHeart() {
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
 	this.isStopHeart = true
 
 }
 
-func (this *client) PrintCall() {
+func (this *Client) PrintCall() {
 	for index, msg := range this.pending {
 		logrus.Infof("index:%d,msg:%+v\n", index, msg.Error)
 	}
 }
 
-func (this *client) input(codec codec.Codec) {
+func (this *Client) input(codec codec.Codec) {
 	var err error
 	for err == nil {
 		var gotMsg msg.Msg
@@ -217,7 +217,7 @@ func (this *client) input(codec codec.Codec) {
 	this.stop(err)
 }
 
-func (this *client) parse(data []byte, argCount int, m *method) []reflect.Value {
+func (this *Client) parse(data []byte, argCount int, m *method) []reflect.Value {
 	argsValue := make([]reflect.Value, m.argCount)
 	var dstData = make([]byte, len(data))
 	copy(dstData, data)
@@ -242,7 +242,7 @@ func (this *client) parse(data []byte, argCount int, m *method) []reflect.Value 
 	return argsValue
 }
 
-func (this *client) call(codec codec.Codec, req *msg.Msg) {
+func (this *Client) call(codec codec.Codec, req *msg.Msg) {
 	et := req.EventType
 	res := &msg.Msg{
 		T:         msg.MsgType_res,
@@ -300,7 +300,7 @@ var sliceType = reflect.TypeOf((*[]string)(nil)).Elem()
 
 // 监听事件
 // if t is reg , first param must the value of reg.FindStringSubmatch(et)
-func (this *client) On(t msg.EventType, Func any) error {
+func (this *Client) On(t msg.EventType, Func any) error {
 	if t == "" {
 		return errors.New("event type must not empty")
 	}
@@ -362,11 +362,11 @@ func (this *client) On(t msg.EventType, Func any) error {
 	return this.emit(msg.MsgType_on, t)
 }
 
-func (this *client) EmitAsync(eventType msg.EventType, args ...any) (call *msg.Call) {
+func (this *Client) EmitAsync(eventType msg.EventType, args ...any) (call *msg.Call) {
 	return this.emit_async(msg.MsgType_req, eventType, args...)
 }
 
-func (this *client) emit_async(t msg.MsgType, eventType msg.EventType, args ...any) (call *msg.Call) {
+func (this *Client) emit_async(t msg.MsgType, eventType msg.EventType, args ...any) (call *msg.Call) {
 	m := &msg.Msg{
 		T:         t,
 		EventType: eventType,
@@ -392,17 +392,17 @@ func (this *client) emit_async(t msg.MsgType, eventType msg.EventType, args ...a
 	return
 }
 
-func (this *client) emit(t msg.MsgType, eventType msg.EventType, args ...any) error {
+func (this *Client) emit(t msg.MsgType, eventType msg.EventType, args ...any) error {
 	call := <-this.emit_async(t, eventType, args...).Done
 	return call.Error
 }
 
 // 触发事件
-func (this *client) Emit(eventType msg.EventType, args ...any) error {
+func (this *Client) Emit(eventType msg.EventType, args ...any) error {
 	return this.emit(msg.MsgType_req, eventType, args...)
 }
 
-func (this *client) send(call *msg.Call) {
+func (this *Client) send(call *msg.Call) {
 	var codec codec.Codec
 	this.mutex.Lock()
 	if !this.connecting {
@@ -434,6 +434,6 @@ func (this *client) send(call *msg.Call) {
 	}
 }
 
-func (this *client) Seq() uint64 {
+func (this *Client) Seq() uint64 {
 	return this.seq
 }
