@@ -102,6 +102,7 @@ func (this *Client) keepAlive() {
 				if err := this.serve(codec); err != nil {
 					logrus.Error("server:", err)
 				}
+				time.Sleep(this.checkInterval * time.Second) //下次去尝试连接
 				continue
 			}
 		} else { //heart
@@ -359,7 +360,15 @@ func (this *Client) On(t msg.EventType, Func any) error {
 		this.events[msg.NewEventTopic(t)] = methods
 	}
 	this.mutex.Unlock()
-	return this.emit(msg.MsgType_on, t)
+	for { //强制成功,因为有些时候,程序启动,事件需要立马注册,有可能链接未完成
+		if err := this.emit(msg.MsgType_on, t); errors.Is(err, ErrNoConnect) {
+			logrus.Errorf("err:%+v", err)
+			time.Sleep(2e9)
+			continue
+		}
+		break
+	}
+	return nil
 }
 
 func (this *Client) EmitAsync(eventType msg.EventType, args ...any) (call *msg.Call) {
@@ -407,7 +416,7 @@ func (this *Client) send(call *msg.Call) {
 	this.mutex.Lock()
 	if !this.connecting {
 		this.mutex.Unlock()
-		call.Error = fmt.Errorf("client is connecting:%v", this.connecting)
+		call.Error = fmt.Errorf("client is connecting:%v,%w", this.connecting, ErrNoConnect)
 		call.Do()
 		return
 	}
