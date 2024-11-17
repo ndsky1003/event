@@ -1,10 +1,14 @@
 package codec
 
-import "github.com/ndsky1003/event/msg"
+import (
+	"io"
+)
 
 // 解码器
 type Codec interface {
-	Read(*msg.Msg) error
-	Write(*msg.Msg) error
+	Read(any) error
+	Write(any) error
 	Close() error
 }
+
+type CreateCodecFunc func(conn io.ReadWriteCloser) (Codec, error)

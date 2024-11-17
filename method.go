@@ -5,9 +5,9 @@ import (
 )
 
 type method struct {
-	function reflect.Value
-	argsType []*argType
-	argCount int
+	function  reflect.Value
+	argsType  []*argType
+	argsCount int
 }
 
 type argType struct {
