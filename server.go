@@ -186,11 +186,7 @@ func (this *server) on(sid uint32, frame *msg.Msg) {
 		v := map[uint32]struct{}{sid: {}}
 		this.monitor[topic.New(en)] = v
 	}
-	if err := this.write(sid, frame); err != nil {
-		err = fmt.Errorf("%w,err:%w", ErrServer, err)
-		logrus.Error(err)
-		this.close(sid, true)
-	}
+	this.write(sid, frame)
 }
 
 func (this *server) req(sid uint32, frame *msg.Msg) {
@@ -204,7 +200,6 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 		serverReqCount: 0,
 	}
 	var isDone bool
-	var needDeleteServiceID []uint32
 	var hasSendServiceID = map[uint32]struct{}{}
 	this.Lock()
 	defer this.Unlock()
@@ -213,13 +208,10 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 		if tp.Match(et) {
 			for sid := range v {
 				if _, ok := hasSendServiceID[sid]; !ok {
-					if err := this.write(sid, frame); err == nil {
-						hasSendServiceID[sid] = struct{}{}
-						isDone = true
-						s_call.serverReqCount++
-					} else {
-						needDeleteServiceID = append(needDeleteServiceID, sid)
-					}
+					this.write(sid, frame)
+					hasSendServiceID[sid] = struct{}{}
+					isDone = true
+					s_call.serverReqCount++ //这里与下面的res在同一个锁里,没问题,但是性能损耗及其严重
 				}
 			}
 		}
@@ -235,16 +227,11 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 		frame.Bytes = nil
 		frame.BodyCount = 0
 		delete(this.pending, server_seq)
-		if err := this.write(sid, frame); err != nil {
-			needDeleteServiceID = append(needDeleteServiceID, sid)
-		}
-	}
-	for _, sid := range needDeleteServiceID {
-		this.close(sid, true)
+		this.write(sid, frame)
 	}
 }
 
-func (this *server) res(sid uint32, serviceName string, msg *msg.Msg) {
+func (this *server) res(_ uint32, serviceName string, msg *msg.Msg) {
 	server_seq := msg.Seq
 	this.Lock()
 	defer this.Unlock()
@@ -265,25 +252,17 @@ func (this *server) res(sid uint32, serviceName string, msg *msg.Msg) {
 				msg.Err = errors.Join(s_call.errs...).Error()
 			}
 			msg.Seq = s_call.origin_seq
-			err := this.write(s_call.origin_sid, msg)
-
-			if err != nil {
-				err = fmt.Errorf("%w,write:%+v err:%w", ErrServer, msg, err)
-				this.close(sid, true)
-			}
+			this.write(s_call.origin_sid, msg)
 			s_call.tn.Stop()
 			delete(this.pending, server_seq)
 		}
 	}
 }
 
-func (this *server) write(sid uint32, msg *msg.Msg) (err error) {
+func (this *server) write(sid uint32, msg *msg.Msg) {
 	if service, ok := this.services[sid]; ok {
-		if err = service.Write(msg); err == nil {
-			return
-		}
+		service.Write(msg)
 	}
-	return
 }
 
 func (this *server) release_timeout(server_seq uint64) {
@@ -297,10 +276,6 @@ func (this *server) release_timeout(server_seq uint64) {
 			Seq: s_call.origin_seq,
 			Err: fmt.Errorf("%w,timeout", ErrServer).Error(),
 		}
-		if err := this.write(s_call.origin_sid, frame); err != nil {
-			err = fmt.Errorf("%w,write err:%w", ErrServer, err)
-			logrus.Error(err)
-			this.close(s_call.origin_sid, true)
-		}
+		this.write(s_call.origin_sid, frame)
 	}
 }

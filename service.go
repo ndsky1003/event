@@ -18,15 +18,29 @@ type service struct {
 	server     *server
 	codec      codec.Codec
 	sync.Mutex //读是单线程，写加锁
+	sendChan   chan *msg.Msg
 }
 
 func newService(server *server, id uint32, codec codec.Codec) *service {
 	s := &service{
-		id:     id,
-		server: server,
-		codec:  codec,
-		done:   make(chan struct{}),
+		id:       id,
+		server:   server,
+		codec:    codec,
+		done:     make(chan struct{}),
+		sendChan: make(chan *msg.Msg, 30),
 	}
+	go func() {
+		for {
+			select {
+			case <-s.done:
+				return
+			case msg := <-s.sendChan:
+				s.write(msg)
+			}
+		}
+
+	}()
+
 	return s
 }
 
@@ -45,7 +59,7 @@ func (this *service) serve() {
 			switch frame.T {
 			case msgtype.Ping:
 				retFrame := &msg.Msg{T: msgtype.Pong, Seq: frame.Seq}
-				err = this.Write(retFrame)
+				this.Write(retFrame)
 			case msgtype.On, msgtype.Req, msgtype.ReqSomeOne, msgtype.Res, msgtype.ResSomeOne:
 				go this.server.handle(this.id, this.name, &frame)
 			default:
@@ -82,10 +96,11 @@ func (this *service) read(msg any) error {
 	return this.codec.Read(msg)
 }
 
-func (this *service) Write(msg any) error {
-	this.Lock()
-	defer this.Unlock()
-	return this.write(msg)
+func (this *service) Write(msg *msg.Msg) {
+	// this.Lock()
+	// defer this.Unlock()
+	this.sendChan <- msg
+	// return this.write(msg)
 }
 
 func (this *service) write(msg any) (err error) {

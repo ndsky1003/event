@@ -358,9 +358,7 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		}
 		m.Bytes = buf.Bytes()
 	}
-	fmt.Println("send start")
 	this.send(call)
-	fmt.Println("send end")
 	return
 }
 
