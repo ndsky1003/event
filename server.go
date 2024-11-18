@@ -33,7 +33,6 @@ type server_call struct {
 	tn         timer.TimeNoder //超时检测,如期返回就stop
 	origin_sid uint32          //原始的sid
 	origin_seq uint64          // frame.需要改成服务器的seq
-	// origin_msg *msg.Msg
 
 	serverReqCount uint64
 	errs           []error
@@ -107,7 +106,7 @@ func (this *server) handle_conn(conn net.Conn) {
 		err = fmt.Errorf("%w,%w", ErrServer, err)
 	}
 
-	if err == nil && firstFrame.Secret != *this.opt.secret {
+	if err == nil && *this.opt.secret != "" && firstFrame.Secret != *this.opt.secret {
 		err = fmt.Errorf("%w,%v", ErrServer, "invalid secret")
 	}
 	if err != nil {
@@ -138,32 +137,6 @@ func (this *server) handle_conn(conn net.Conn) {
 	go service.serve()
 
 }
-
-// var errTimeout = errors.New("req timeout")
-//
-// func (this *server) checkTimeOut() {
-// 	for {
-// 		this.Lock()
-// 		for _, reqMeta := range this.reqMetas {
-// 			if time.Now().Sub(reqMeta.Time) > this.reqTimeOut*time.Second { //
-// 				gotMsg := &msg.Msg{
-// 					T:         msg.MsgType_res,
-// 					ServerSeq: reqMeta.serverReqSeq,
-// 					ClientSeq: reqMeta.clientSeq,
-// 					EventType: reqMeta.EventType,
-// 					Error:     errTimeout.Error(),
-// 				}
-// 				delete(this.reqMetas, reqMeta.serverReqSeq)
-// 				if err := this.write(reqMeta.reqServerID, gotMsg); err != nil {
-// 					this.close(reqMeta.reqServerID)
-// 				}
-// 			}
-//
-// 		}
-// 		this.Unlock()
-// 		time.Sleep(2 * time.Second)
-// 	}
-// }
 
 func (this *server) Close(sid uint32, isCloseSon bool) error {
 	this.Lock()
@@ -226,8 +199,7 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 	origin_seq := frame.Seq
 	frame.Seq = server_seq
 	s_call := &server_call{
-		origin_sid: sid,
-		// origin_msg:     frame,
+		origin_sid:     sid,
 		origin_seq:     origin_seq,
 		serverReqCount: 0,
 	}
@@ -253,7 +225,11 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 		}
 	}
 
-	if !isDone {
+	if isDone {
+		s_call.tn = this.tm.AfterFunc(*this.opt.Timeout*time.Second, func() {
+			this.release_timeout(server_seq)
+		})
+	} else {
 		frame.T = msgtype.Res
 		frame.Seq = s_call.origin_seq
 		frame.Bytes = nil
@@ -263,22 +239,9 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 			needDeleteServiceID = append(needDeleteServiceID, sid)
 		}
 	}
-	s_call.tn = this.tm.AfterFunc(*this.opt.Timeout*time.Second, func() {
-		this.release_timeout(server_seq)
-	})
 	for _, sid := range needDeleteServiceID {
 		this.close(sid, true)
 	}
-	// if isDone && s_call.serverReqCount == 0 { //接收比较快
-	// 	res := &msg.Msg{
-	// 		T:   msgtype.Res,
-	// 		Seq: frame.Seq,
-	// 	}
-	// 	if s_call.existErr {
-	// 		res.Err = strings.Join(s_call.errs, ";")
-	// 	}
-	// 	this.write(s_call.origin_sid, res)
-	// }
 }
 
 func (this *server) res(sid uint32, serviceName string, msg *msg.Msg) {

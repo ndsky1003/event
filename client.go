@@ -26,13 +26,16 @@ func init() {
 }
 
 type Client struct {
-	url        string
-	seq        uint64
-	opt        *ClientOption
-	codecFunc  codec.CreateCodecFunc
+	url       string
+	seq       uint64
+	opt       *ClientOption
+	codecFunc codec.CreateCodecFunc
+
+	rwl    sync.RWMutex // protect under ,这个显然是读大于写,写只有on的时候用
+	topics map[*topic.Topic][]*method
+
 	sync.Mutex // protect under
 	codec      codec.Codec
-	topics     map[*topic.Topic][]*method
 	pending    map[uint64]*Call
 	connecting bool // client is connecting
 }
@@ -144,9 +147,11 @@ func (this *Client) stop(err error) {
 		call.done()
 	}
 
+	this.rwl.Lock()
 	for tp := range this.topics {
 		tp.IsRegistSuccess = false
 	}
+	this.rwl.Unlock()
 
 	if this.codec != nil {
 		this.codec.Close()
@@ -233,7 +238,7 @@ func (this *Client) func_call(req *msg.Msg) {
 		Seq:       req.Seq,
 		EventName: et,
 	}
-	this.Lock()
+	this.rwl.RLock()
 	var isHaveTP bool
 	topics_tmp := map[*topic.Topic][]*method{}
 	for tp, funcs := range this.topics {
@@ -242,7 +247,7 @@ func (this *Client) func_call(req *msg.Msg) {
 			isHaveTP = true
 		}
 	}
-	this.Unlock()
+	this.rwl.RUnlock()
 	if isHaveTP {
 		var errs []error
 		for tp, methods := range topics_tmp {
@@ -304,26 +309,20 @@ func (this *Client) regist_topic() {
 }
 
 func (this *Client) regist_topic_lock() error {
-	needRegistTopic := map[*topic.Topic]struct{}{}
-	this.Lock()
+	var errs []error
+	this.rwl.Lock()
 	for tp := range this.topics {
 		if !tp.IsRegistSuccess {
-			needRegistTopic[tp] = struct{}{}
+			if err := this.emit(msgtype.On, tp.GetEventName()); err != nil {
+				err := fmt.Errorf("%w, emit_on:[%v] err:%w", ErrClient, tp.GetEventName(), err)
+				logrus.Error(err)
+				errs = append(errs, err)
+			} else {
+				tp.IsRegistSuccess = true
+			}
 		}
 	}
-	this.Unlock()
-
-	var errs []error
-	for tp := range needRegistTopic {
-		if err := this.emit(msgtype.On, tp.GetEventName()); err != nil {
-			err := fmt.Errorf("%w, emit_on err:%w", ErrClient, err)
-			logrus.Error(err)
-			errs = append(errs, err)
-		} else {
-			tp.IsRegistSuccess = true
-		}
-	}
-
+	this.rwl.Unlock()
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -359,7 +358,9 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		}
 		m.Bytes = buf.Bytes()
 	}
+	fmt.Println("send start")
 	this.send(call)
+	fmt.Println("send end")
 	return
 }
 

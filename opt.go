@@ -63,6 +63,9 @@ func (this *ClientOption) merges(opts ...*ClientOption) *ClientOption {
 }
 
 func (this *ClientOption) merge(opt *ClientOption) {
+	if opt == nil {
+		return
+	}
 	if opt.name != nil {
 		this.name = opt.name
 	}
@@ -102,6 +105,9 @@ func (this *ServerOption) merges(opts ...*ServerOption) *ServerOption {
 }
 
 func (this *ServerOption) merge(opt *ServerOption) {
+	if opt == nil {
+		return
+	}
 	if opt.Timeout != nil {
 		this.Timeout = opt.Timeout
 	}

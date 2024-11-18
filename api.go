@@ -66,7 +66,7 @@ func (this *Client) On(t eventname.T, Func any) {
 		argsType:  argsType,
 		argsCount: inCount,
 	}
-	this.Lock()
+	this.rwl.Lock()
 	var isExist bool
 	var methods []*method
 	var topic *topic.Topic
@@ -84,7 +84,7 @@ func (this *Client) On(t eventname.T, Func any) {
 		methods = []*method{mType}
 		this.topics[newtp] = methods
 	}
-	this.Unlock()
+	this.rwl.Unlock()
 	if !isExist {
 		go this.regist_topic()
 	}
