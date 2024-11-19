@@ -93,7 +93,7 @@ func (this *Client) keepAlive() {
 			}
 		} else {
 			if heat_interval > 0 {
-				if call := this.emit_async(msgtype.Ping, ""); call != nil {
+				if call := this.emit_async(msgtype.Ping, "ping"); call != nil {
 					err := call.Err
 					if err != nil { //这里是同步触发的错误
 						logrus.Error(err)

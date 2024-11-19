@@ -104,6 +104,14 @@ func (this *service) Write(msg *msg.Msg) {
 }
 
 func (this *service) write(msg any) (err error) {
+	if this.codec == nil {
+		return
+	}
+	this.Lock()
+	defer this.Unlock()
+	if this.codec == nil {
+		return
+	}
 	if err = this.codec.Write(msg); err != nil {
 		return fmt.Errorf("%w,codec write err:%w", ErrServer, err)
 	}
