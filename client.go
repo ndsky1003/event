@@ -147,11 +147,13 @@ func (this *Client) stop(err error) {
 		call.done()
 	}
 
-	this.rwl.Lock()
+	//FIXME: 这里放开也死锁了,这里先获取锁,再获取的写锁,
+	//注册on的时候,是先获取的读写锁在获取的互斥锁.2个地方嵌套了
+	// this.rwl.Lock()
 	for tp := range this.topics {
 		tp.IsRegistSuccess = false
 	}
-	this.rwl.Unlock()
+	// this.rwl.Unlock()
 
 	if this.codec != nil {
 		this.codec.Close()
@@ -370,6 +372,7 @@ func (this *Client) emit(t msgtype.T, en eventname.T, args ...any) error {
 func (this *Client) send(call *Call) {
 	seq := atomic.AddUint64(&this.seq, 1)
 	var err error
+	// logrus.Infof("send seq:%+v", call)
 	this.Lock()
 	defer this.Unlock()
 	this.pending[seq] = call

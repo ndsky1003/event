@@ -18,15 +18,15 @@ import (
 )
 
 type server struct {
-	codecFunc  codec.CreateCodecFunc
-	sid        uint32
-	opt        *ServerOption
-	seq        uint64
-	tm         timer.Timer //时间轮
-	sync.Mutex             //protect under
-	monitor    map[*topic.Topic]map[uint32]struct{}
-	services   map[uint32]*service
-	pending    map[uint64]*server_call //server to client 调用的call
+	codecFunc codec.CreateCodecFunc
+	sid       uint32
+	opt       *ServerOption
+	seq       uint64
+	tm        timer.Timer //时间轮
+	l         sync.Mutex  //protect under
+	monitor   map[*topic.Topic]map[uint32]struct{}
+	services  map[uint32]*service
+	pending   map[uint64]*server_call //server to client 调用的call
 }
 
 type server_call struct {
@@ -130,17 +130,17 @@ func (this *server) handle_conn(conn net.Conn) {
 		}
 		return
 	}
-	this.Lock()
+	this.l.Lock()
 	this.services[this.sid] = service
-	this.Unlock()
+	this.l.Unlock()
 	logrus.Infof("service:%s[%d] is ready", firstFrame.Name, this.sid)
 	go service.serve()
 
 }
 
 func (this *server) Close(sid uint32, isCloseSon bool) error {
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
+	defer this.l.Unlock()
 	return this.close(sid, isCloseSon)
 }
 
@@ -150,7 +150,8 @@ func (this *server) close(sid uint32, isCloseSon bool) (err error) {
 	}
 	if service, ok := this.services[sid]; ok {
 		if isCloseSon {
-			err = service.Close(false)
+			fmt.Println(4)
+			service.Close(false)
 		}
 		delete(this.services, sid)
 	}
@@ -173,8 +174,7 @@ func (this *server) handle(sid uint32, sname string, frame *msg.Msg) {
 
 func (this *server) on(sid uint32, frame *msg.Msg) {
 	en := frame.EventName
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
 	var is_exist bool
 	for tp, sids := range this.monitor {
 		if tp.Equal(en) {
@@ -186,6 +186,7 @@ func (this *server) on(sid uint32, frame *msg.Msg) {
 		v := map[uint32]struct{}{sid: {}}
 		this.monitor[topic.New(en)] = v
 	}
+	this.l.Unlock()
 	this.write(sid, frame)
 }
 
@@ -201,14 +202,12 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 	}
 	var isDone bool
 	var hasSendServiceID = map[uint32]struct{}{}
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
 	this.pending[server_seq] = s_call
 	for tp, v := range this.monitor {
 		if tp.Match(et) {
 			for sid := range v {
 				if _, ok := hasSendServiceID[sid]; !ok {
-					this.write(sid, frame)
 					hasSendServiceID[sid] = struct{}{}
 					isDone = true
 					s_call.serverReqCount++ //这里与下面的res在同一个锁里,没问题,但是性能损耗及其严重
@@ -216,7 +215,10 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 			}
 		}
 	}
-
+	this.l.Unlock()
+	for sid := range hasSendServiceID {
+		this.write(sid, frame)
+	}
 	if isDone {
 		s_call.tn = this.tm.AfterFunc(*this.opt.Timeout*time.Second, func() {
 			this.release_timeout(server_seq)
@@ -226,16 +228,18 @@ func (this *server) req(sid uint32, frame *msg.Msg) {
 		frame.Seq = s_call.origin_seq
 		frame.Bytes = nil
 		frame.BodyCount = 0
+		this.l.Lock()
 		delete(this.pending, server_seq)
+		this.l.Unlock()
 		this.write(sid, frame)
 	}
 }
 
 func (this *server) res(_ uint32, serviceName string, msg *msg.Msg) {
 	server_seq := msg.Seq
-	this.Lock()
-	defer this.Unlock()
-	if s_call, ok := this.pending[server_seq]; ok {
+	this.l.Lock()
+	s_call, ok := this.pending[server_seq]
+	if ok {
 		s_call.serverReqCount--
 		leftCount := s_call.serverReqCount
 		if e := msg.Err; e != "" {
@@ -252,10 +256,15 @@ func (this *server) res(_ uint32, serviceName string, msg *msg.Msg) {
 				msg.Err = errors.Join(s_call.errs...).Error()
 			}
 			msg.Seq = s_call.origin_seq
-			this.write(s_call.origin_sid, msg)
-			s_call.tn.Stop()
+			if s_call.tn != nil {
+				s_call.tn.Stop()
+			}
 			delete(this.pending, server_seq)
 		}
+	}
+	this.l.Unlock()
+	if ok && (s_call.serverReqCount == 0 || msg.T == msgtype.ResSomeOne) {
+		this.write(s_call.origin_sid, msg)
 	}
 }
 
@@ -266,11 +275,17 @@ func (this *server) write(sid uint32, msg *msg.Msg) {
 }
 
 func (this *server) release_timeout(server_seq uint64) {
-	this.Lock()
-	defer this.Unlock()
-	if s_call, ok := this.pending[server_seq]; ok {
-		s_call.tn.Stop()
+	this.l.Lock()
+	s_call, ok := this.pending[server_seq]
+	if ok {
+		if s_call.tn != nil {
+			s_call.tn.Stop()
+		}
 		delete(this.pending, server_seq)
+	}
+	this.l.Unlock()
+
+	if ok {
 		frame := &msg.Msg{
 			T:   msgtype.Res,
 			Seq: s_call.origin_seq,
