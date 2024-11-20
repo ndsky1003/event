@@ -34,7 +34,7 @@ type Client struct {
 	rwl    sync.RWMutex // protect under ,这个显然是读大于写,写只有on的时候用
 	topics map[*topic.Topic][]*method
 
-	sync.Mutex // protect under
+	l          sync.Mutex // protect under ,直接嵌套会被暴露出去
 	codec      codec.Codec
 	pending    map[uint64]*Call
 	connecting bool // client is connecting
@@ -61,8 +61,8 @@ func Dial(url string, opts ...*ClientOption) *Client {
 }
 
 func (this *Client) getConnecting() bool {
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
+	defer this.l.Unlock()
 	return this.connecting
 }
 
@@ -109,10 +109,10 @@ func (this *Client) keepAlive() {
 }
 
 func (this *Client) serve(codec codec.Codec) (err error) {
-	this.Lock()
+	this.l.Lock()
 	defer func() {
 		if err != nil {
-			this.Unlock()
+			this.l.Unlock()
 		}
 	}()
 	if err = codec.Write(&msg.MsgVerifyReq{Name: *this.opt.name, Secret: *this.opt.secret}); err != nil {
@@ -129,14 +129,14 @@ func (this *Client) serve(codec codec.Codec) (err error) {
 	}
 	this.connecting = true
 	this.codec = codec
-	this.Unlock()
+	this.l.Unlock()
 	go this.input(codec)
 	return
 }
 
 func (this *Client) Stop(err error) {
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
+	defer this.l.Unlock()
 	this.stop(err)
 }
 
@@ -180,10 +180,10 @@ func (this *Client) input(codec codec.Codec) {
 			go this.func_call(&gotMsg)
 		case msgtype.Res, msgtype.ResSomeOne, msgtype.On, msgtype.Pong:
 			seq := gotMsg.Seq
-			this.Lock()
+			this.l.Lock()
 			call := this.pending[seq]
 			delete(this.pending, seq)
-			this.Unlock()
+			this.l.Unlock()
 			if call != nil {
 				if gotMsg.Err != "" {
 					var err error
@@ -284,8 +284,8 @@ func (this *Client) func_call(req *msg.Msg) {
 }
 
 func (this *Client) Write(msg *msg.Msg) error {
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
+	defer this.l.Unlock()
 	if err := this.write(msg); err != nil {
 		this.stop(err)
 		return err
@@ -373,8 +373,8 @@ func (this *Client) send(call *Call) {
 	seq := atomic.AddUint64(&this.seq, 1)
 	var err error
 	// logrus.Infof("send seq:%+v", call)
-	this.Lock()
-	defer this.Unlock()
+	this.l.Lock()
+	defer this.l.Unlock()
 	this.pending[seq] = call
 	call.Msg.Seq = seq
 	if b := this.connecting; !b {
