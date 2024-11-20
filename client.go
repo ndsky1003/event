@@ -149,6 +149,7 @@ func (this *Client) stop(err error) {
 
 	//FIXME: 这里放开也死锁了,这里先获取锁,再获取的写锁,
 	//注册on的时候,是先获取的读写锁在获取的互斥锁.2个地方嵌套了
+	//理论上有问题,使用场景不会频繁触发on来触发这个读写topics,map的错误.忽略掉
 	// this.rwl.Lock()
 	for tp := range this.topics {
 		tp.IsRegistSuccess = false
@@ -204,8 +205,6 @@ func (this *Client) input(codec codec.Codec) {
 
 func (this *Client) parse(req_body_data []byte, req_args_count int, m *method) (argsValue []reflect.Value, err error) {
 	argsValue = make([]reflect.Value, m.argsCount)
-	// var dstData = make([]byte, len(req_body_data))
-	// copy(dstData, req_body_data)
 	dec := gob.NewDecoder(bytes.NewReader(req_body_data))
 	for i := 0; i < m.argsCount; i++ {
 		argType := m.argsType[i]
@@ -372,7 +371,6 @@ func (this *Client) emit(t msgtype.T, en eventname.T, args ...any) error {
 func (this *Client) send(call *Call) {
 	seq := atomic.AddUint64(&this.seq, 1)
 	var err error
-	// logrus.Infof("send seq:%+v", call)
 	this.l.Lock()
 	defer this.l.Unlock()
 	this.pending[seq] = call
