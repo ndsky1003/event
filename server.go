@@ -131,9 +131,9 @@ func (this *server) handle_conn(conn net.Conn) {
 		return
 	}
 	this.l.Lock()
-	this.services[this.sid] = service
+	this.services[sid] = service
 	this.l.Unlock()
-	logrus.Infof("service:%s[%d] is ready", firstFrame.Name, this.sid)
+	logrus.Infof("event service:%s[%d] is ready", firstFrame.Name, sid)
 	go service.serve()
 
 }
