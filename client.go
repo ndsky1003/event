@@ -2,349 +2,294 @@ package event
 
 import (
 	"bytes"
-	"encoding/gob"
+	"context"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"reflect"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/ndsky1003/buffer"
-	"github.com/ndsky1003/event/v2/codec"
 	"github.com/ndsky1003/event/v2/eventname"
 	"github.com/ndsky1003/event/v2/msg"
 	"github.com/ndsky1003/event/v2/msgtype"
 	"github.com/ndsky1003/event/v2/topic"
-	"github.com/sirupsen/logrus"
+	"github.com/ndsky1003/net/v2/client"
+	"github.com/ndsky1003/net/v2/conn"
+	"github.com/vmihailenco/msgpack/v5"
 )
 
-func init() {
-	logrus.SetReportCaller(true)
-}
-
+// Client 事件客户端
 type Client struct {
-	url       string
-	seq       uint64
-	opt       *ClientOption
-	codecFunc codec.CreateCodecFunc
+	url      string
+	opt      *ClientOption
+	netCl    *client.Client
+	seq      uint64
 
-	rwl    sync.RWMutex // protect under ,这个显然是读大于写,写只有on的时候用
+	rwl    sync.RWMutex
 	topics map[*topic.Topic][]*method
 
-	l          sync.Mutex // protect under ,直接嵌套会被暴露出去
-	codec      codec.Codec
-	pending    map[uint64]*Call
-	connecting bool // client is connecting
+	l             sync.Mutex
+	pending       map[uint64]*Call
+	registing     bool          // 是否正在注册 topics
+	registDoneCh  chan struct{} // 注册完成通知
 }
 
+// Dial 连接到服务器
 func Dial(url string, opts ...*ClientOption) *Client {
-	c := &Client{
-		url:     url,
-		topics:  make(map[*topic.Topic][]*method),
-		pending: make(map[uint64]*Call),
-		codecFunc: func(conn io.ReadWriteCloser) (codec.Codec, error) {
-			return codec.NewGobCodec(conn), nil
-		},
-	}
-	c.opt = ClientOptions().
+	opt := ClientOptions().
 		SetName("").
-		SetCheckInterval(2).
-		SetHeartInterval(20).
 		SetSecret("").
 		SetIsWrapError(true).
-		merges(opts...)
-	go c.keepAlive()
+		Merge(opts...)
+
+	c := &Client{
+		url:          url,
+		topics:       make(map[*topic.Topic][]*method),
+		pending:      make(map[uint64]*Call),
+		opt:          opt,
+		registDoneCh: make(chan struct{}),
+	}
+
+	// 创建 handler
+	handler := &eventHandler{client: c}
+
+	// 使用 net.Client.Dial
+	ctx, cancel := context.WithCancel(context.Background())
+	netCl, err := client.Dial(ctx, *opt.Name, url,
+		client.Options().
+			SetHandler(handler).
+			SetOnConnected(c.onConnect).
+			WithConn(func(copt *conn.Option) {
+				// 设置 buffer 生成函数
+				copt.SetGenBufFn(func() []byte {
+					return make([]byte, 1024*4)
+				})
+			}),
+	)
+	if err != nil {
+		slog.Error("dial failed", "err", err)
+		cancel()
+		return c
+	}
+
+	c.netCl = netCl
+	go func() {
+		<-ctx.Done()
+		c.Stop(context.Canceled)
+	}()
+
 	return c
 }
 
-func (this *Client) getConnecting() bool {
-	this.l.Lock()
-	defer this.l.Unlock()
-	return this.connecting
-}
-
-func (this *Client) keepAlive() {
-	heat_interval := *this.opt.heart_interval
-	for {
-		if !this.getConnecting() {
-			conn, err := net.Dial("tcp", this.url)
-			if err != nil {
-				err = fmt.Errorf("%w Dail err:%w", ErrClient, err)
-				logrus.Error(err)
-				time.Sleep(*this.opt.check_interval * time.Second)
-				continue
-			}
-			codec, err := this.codecFunc(conn)
-			if err != nil {
-				err = fmt.Errorf("%w newcodec err:%w", ErrClient, err)
-				logrus.Error(err)
-				time.Sleep(*this.opt.check_interval * time.Second)
-				continue
-			} else {
-				if err := this.serve(codec); err != nil {
-					err = fmt.Errorf("%w serve err:%w", ErrClient, err)
-					logrus.Error(err)
-				}
-				time.Sleep(*this.opt.check_interval * time.Second) //下次去尝试连接
-				continue
-			}
-		} else {
-			if heat_interval > 0 {
-				if call := this.emit_async(msgtype.Ping, "ping"); call != nil {
-					err := call.Err
-					if err != nil { //这里是同步触发的错误
-						logrus.Error(err)
-						this.Stop(err)
-					}
-				}
-				time.Sleep(heat_interval * time.Second)
-			} else {
-				time.Sleep(*this.opt.check_interval * time.Second) //下次去尝试连接
-			}
-		}
+// onConnect 连接成功后的验证逻辑
+func (c *Client) onConnect(cnn *conn.Conn) error {
+	// 1. 发送验证请求
+	verifyReq := &msg.MsgVerifyReq{
+		Name:   *c.opt.Name,
+		Secret: *c.opt.Secret,
 	}
-}
-
-func (this *Client) serve(codec codec.Codec) (err error) {
-	this.l.Lock()
-	defer func() {
-		if err != nil {
-			this.l.Unlock()
-		}
-	}()
-	if err = codec.Write(&msg.MsgVerifyReq{Name: *this.opt.name, Secret: *this.opt.secret}); err != nil {
-		return
-	}
-	var readFirstMsg msg.MsgVerifyRes
-	if err = codec.Read(&readFirstMsg); err != nil {
-		return
+	buf := bufPool.Get().(*bytes.Buffer)
+	defer bufPool.Put(buf)
+	buf.Reset()
+	enc := msgpack.GetEncoder()
+	defer msgpack.PutEncoder(enc)
+	enc.Reset(buf)
+	if err := enc.Encode(verifyReq); err != nil {
+		return fmt.Errorf("encode verify request failed: %w", err)
 	}
 
-	if readFirstMsg.Err != "" {
-		err = errors.New(readFirstMsg.Err)
-		return
+	// 使用 conn.Write 发送
+	if err := cnn.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("write verify request failed: %w", err)
 	}
-	this.connecting = true
-	this.codec = codec
-	this.l.Unlock()
-	go this.input(codec)
-	return
-}
-
-func (this *Client) Stop(err error) {
-	this.l.Lock()
-	defer this.l.Unlock()
-	this.stop(err)
-}
-
-func (this *Client) stop(err error) {
-	for _, call := range this.pending {
-		call.Err = err
-		logrus.Errorf("%+v,err:%v", call.Msg, call.Err)
-		call.done()
+	if err := cnn.Flush(); err != nil {
+		return fmt.Errorf("flush verify request failed: %w", err)
 	}
 
-	//FIXME: 这里放开也死锁了,这里先获取锁,再获取的写锁,
-	//注册on的时候,是先获取的读写锁在获取的互斥锁.2个地方嵌套了
-	//理论上有问题,使用场景不会频繁触发on来触发这个读写topics,map的错误.忽略掉
-	// this.rwl.Lock()
-	for tp := range this.topics {
-		tp.IsRegistSuccess = false
-	}
-	// this.rwl.Unlock()
-
-	if this.codec != nil {
-		this.codec.Close()
-		this.codec = nil
-	}
-	this.seq = 0
-	this.pending = make(map[uint64]*Call)
-	this.connecting = false
-}
-
-func (this *Client) input(codec codec.Codec) {
-	go this.regist_topic()
-	var err error
-	for err == nil {
-		var gotMsg msg.Msg
-		err = codec.Read(&gotMsg)
-		if err != nil {
-			err = fmt.Errorf("%w,read body err:%w", ErrClientDecode, err)
-			break
-		}
-		switch gotMsg.T {
-		case msgtype.Ping:
-		case msgtype.Req, msgtype.ReqSomeOne:
-			go this.func_call(&gotMsg)
-		case msgtype.Res, msgtype.ResSomeOne, msgtype.On, msgtype.Pong:
-			seq := gotMsg.Seq
-			this.l.Lock()
-			call := this.pending[seq]
-			delete(this.pending, seq)
-			this.l.Unlock()
-			if call != nil {
-				if gotMsg.Err != "" {
-					var err error
-					if *this.opt.is_wrap_error {
-						err = fmt.Errorf("%w,%v", ErrServer, gotMsg.Err)
-					} else {
-						err = errors.New(gotMsg.Err)
-					}
-					call.Err = err
-				}
-				call.done()
-			}
-		}
-	}
-	logrus.Error(err)
-	this.Stop(err)
-}
-
-func (this *Client) parse(req_body_data []byte, req_args_count int, m *method) (argsValue []reflect.Value, err error) {
-	argsValue = make([]reflect.Value, m.argsCount)
-	dec := gob.NewDecoder(bytes.NewReader(req_body_data))
-	for i := 0; i < m.argsCount; i++ {
-		argType := m.argsType[i]
-		at := argType.at
-		if argType.isPointer {
-			at = at.Elem()
-		}
-		argValue := reflect.New(at)
-		if i < req_args_count {
-			if err = dec.Decode(argValue.Interface()); err != nil {
-				ft := m.function.Type()
-				err = fmt.Errorf("%w,parse func[%v] body [%v] arg err:%w", ErrClient, ft, i, err)
-				return
-			}
-		}
-		if !argType.isPointer {
-			argValue = argValue.Elem()
-		}
-		argsValue[i] = argValue
-	}
-	return
-}
-
-func (this *Client) func_call(req *msg.Msg) {
-	et := req.EventName
-	t := msgtype.Res
-	if req.T == msgtype.ReqSomeOne {
-		t = msgtype.ResSomeOne
-	}
-	res := &msg.Msg{
-		T:         t,
-		Seq:       req.Seq,
-		EventName: et,
-	}
-	this.rwl.RLock()
-	var isHaveTP bool
-	topics_tmp := map[*topic.Topic][]*method{}
-	for tp, funcs := range this.topics {
-		if tp.Match(et) {
-			topics_tmp[tp] = funcs
-			isHaveTP = true
-		}
-	}
-	this.rwl.RUnlock()
-	if isHaveTP {
-		var errs []error
-		for tp, methods := range topics_tmp {
-			for _, method := range methods {
-				args, err := this.parse(req.Bytes, int(req.BodyCount), method)
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
-				if tp.IsReg {
-					args = append([]reflect.Value{reflect.ValueOf(tp.FindStringSubmatch(et))}, args...)
-				}
-				returnValues := method.function.Call(args)
-				err_value := returnValues[0]
-				if err_value.IsValid() && !err_value.IsNil() {
-					appendErr := err_value.Interface().(error)
-					if *this.opt.is_wrap_error {
-						appendErr = fmt.Errorf("[client:%v,topic:%v,event:%s,err:%w]", *this.opt.name, tp.GetEventName(), et, appendErr)
-					}
-					errs = append(errs, appendErr)
-				}
-			}
-		}
-		if len(errs) > 0 {
-			res.Err = errors.Join(errs...).Error()
-		}
+	// 2. 读取验证响应
+	data, err := cnn.Read()
+	if err != nil {
+		return fmt.Errorf("read verify response failed: %w", err)
 	}
 
-	if err := this.Write(res); err != nil {
-		logrus.Error(err)
-	}
-}
+	var verifyRes msg.MsgVerifyRes
+	dec := msgpack.GetDecoder()
+	defer msgpack.PutDecoder(dec)
 
-func (this *Client) Write(msg *msg.Msg) error {
-	this.l.Lock()
-	defer this.l.Unlock()
-	if err := this.write(msg); err != nil {
-		this.stop(err)
-		return err
+	reader := readerPool.Get().(*bytes.Reader)
+	reader.Reset(data)
+	dec.Reset(reader)
+	defer readerPool.Put(reader)
+
+	if err := dec.Decode(&verifyRes); err != nil {
+		return fmt.Errorf("decode verify response failed: %w", err)
 	}
+
+	if verifyRes.Err != "" {
+		return errors.New(verifyRes.Err)
+	}
+
+	// 3. 注册 topics
+	go c.registTopic()
+
 	return nil
 }
 
-func (this *Client) write(msg *msg.Msg) error {
-	if codec := this.codec; codec != nil {
-		return codec.Write(msg)
+// Stop 停止客户端
+func (c *Client) Stop(err error) {
+	c.l.Lock()
+	// 取消之前的注册
+	select {
+	case <-c.registDoneCh:
+	default:
+		close(c.registDoneCh)
 	}
-	return ErrClientCodecNil
+
+	for seq, call := range c.pending {
+		call.Err = err
+		slog.Error("call error", "msg", call.Msg, "err", call.Err)
+		call.done()
+		delete(c.pending, seq)
+	}
+
+	// 重置 topics 注册状态
+	c.rwl.Lock()
+	for tp := range c.topics {
+		tp.IsRegistSuccess = false
+	}
+	c.rwl.Unlock()
+
+	// 不关闭 netCl，让 net/v2 自动重连
+	c.seq = 0
+	c.pending = make(map[uint64]*Call)
+
+	// 重新创建 registDoneCh
+	c.registDoneCh = make(chan struct{})
+	c.l.Unlock()
 }
 
-func (this *Client) regist_topic() {
+// registTopic 注册所有 topics
+func (c *Client) registTopic() {
+	c.l.Lock()
+	if c.registing {
+		c.l.Unlock()
+		return
+	}
+	c.registing = true
+	c.l.Unlock()
+
+	defer func() {
+		c.l.Lock()
+		c.registing = false
+		c.l.Unlock()
+	}()
+
 	for {
-		if err := this.regist_topic_lock(); err != nil {
-			time.Sleep(2 * time.Second)
-			continue
+		select {
+		case <-c.registDoneCh:
+			return
+		default:
+		}
+		if err := c.registTopicLock(); err != nil {
+			select {
+			case <-c.registDoneCh:
+				return
+			case <-time.After(2 * time.Second):
+				continue
+			}
 		}
 		return
 	}
 }
 
-func (this *Client) regist_topic_lock() error {
-	var errs []error
-	this.rwl.Lock()
-	for tp := range this.topics {
+func (c *Client) registTopicLock() error {
+	// 先收集需要注册的 topics，避免持有锁时进行网络调用
+	type pendingTopic struct {
+		topic  *topic.Topic
+		name   eventname.T
+	}
+	var pending []pendingTopic
+
+	c.rwl.Lock()
+	for tp := range c.topics {
 		if !tp.IsRegistSuccess {
-			if err := this.emit(msgtype.On, tp.GetEventName()); err != nil {
-				err := fmt.Errorf("%w, emit_on:[%v] err:%w", ErrClient, tp.GetEventName(), err)
-				logrus.Error(err)
-				errs = append(errs, err)
-			} else {
-				tp.IsRegistSuccess = true
-			}
+			pending = append(pending, pendingTopic{topic: tp, name: tp.GetEventName()})
 		}
 	}
-	this.rwl.Unlock()
+	c.rwl.Unlock()
+
+	// 释放锁后再进行注册
+	var errs []error
+	for _, p := range pending {
+		if err := c.emit(msgtype.On, p.name); err != nil {
+			err := fmt.Errorf("%w, emit_on:[%v] err:%w", ErrClient, p.name, err)
+			slog.Error("emit_on failed", "topic", p.name, "err", err)
+			errs = append(errs, err)
+		} else {
+			p.topic.IsRegistSuccess = true
+		}
+	}
+
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
 	return nil
 }
 
-func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *Call) {
+// Write 写入消息
+func (c *Client) Write(m *msg.Msg) error {
+	c.l.Lock()
+	defer c.l.Unlock()
+	if err := c.write(m); err != nil {
+		// write 失败，net/v2 会自动重连，这里只需要重置注册状态
+		c.rwl.Lock()
+		for tp := range c.topics {
+			tp.IsRegistSuccess = false
+		}
+		c.rwl.Unlock()
+		return err
+	}
+	return nil
+}
+
+func (c *Client) write(m *msg.Msg) error {
+	if c.netCl == nil || !c.netCl.IsConnected() {
+		return ErrNoConnect
+	}
+
+	// 编码消息
+	data, err := encodeMsg(m)
+	if err != nil {
+		return fmt.Errorf("encode message failed: %w", err)
+	}
+
+	// 发送
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return c.netCl.Send(ctx, data)
+}
+
+// emitAsync 异步发送
+func (c *Client) emitAsync(t msgtype.T, en eventname.T, args ...any) *Call {
 	m := &msg.Msg{
 		T:         t,
 		EventName: en,
 		BodyCount: int8(len(args)),
 	}
-	call = NewCall(m)
+	call := NewCall(m)
 	if m.EventName == "" {
 		call.Err = fmt.Errorf("%w,%v", ErrServer, "event name empty")
 		call.done()
 	}
+
 	if len(args) > 0 {
 		buf := buffer.Get()
 		defer buf.Release()
-		paramEncoder := gob.NewEncoder(buf)
+		paramEncoder := msgpack.GetEncoder()
+		defer msgpack.PutEncoder(paramEncoder)
+		paramEncoder.Reset(buf)
 		var err error
 		for _, arg := range args {
 			if err = paramEncoder.Encode(arg); err != nil {
@@ -355,34 +300,41 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		if err != nil {
 			call.Err = err
 			call.done()
-			return
+			return call
 		}
 		m.Bytes = buf.Bytes()
 	}
-	this.send(call)
-	return
+
+	c.send(call)
+	return call
 }
 
-func (this *Client) emit(t msgtype.T, en eventname.T, args ...any) error {
-	call := <-this.emit_async(t, en, args...).Done
+// emit 同步发送
+func (c *Client) emit(t msgtype.T, en eventname.T, args ...any) error {
+	call := <-c.emitAsync(t, en, args...).Done
 	return call.Err
 }
 
-func (this *Client) send(call *Call) {
-	seq := atomic.AddUint64(&this.seq, 1)
+// send 发送调用
+func (c *Client) send(call *Call) {
+	seq := atomic.AddUint64(&c.seq, 1)
 	var err error
-	this.l.Lock()
-	defer this.l.Unlock()
-	this.pending[seq] = call
+
+	c.l.Lock()
+	defer c.l.Unlock()
+	c.pending[seq] = call
 	call.Msg.Seq = seq
-	if b := this.connecting; !b {
-		err = fmt.Errorf("%w %w connecting:%v", ErrClient, ErrNoConnect, b)
+
+	if c.netCl == nil || !c.netCl.IsConnected() {
+		err = fmt.Errorf("%w %w connecting:%v", ErrClient, ErrNoConnect, c.netCl != nil && c.netCl.IsConnected())
 	}
+
 	if err == nil {
-		err = this.write(call.Msg) //this.codec.Write(call.Msg)
+		err = c.write(call.Msg)
 	}
+
 	if err != nil {
-		delete(this.pending, seq)
+		delete(c.pending, seq)
 		call.Err = err
 		call.done()
 	}

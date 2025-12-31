@@ -6,26 +6,24 @@ type T uint8
 
 const (
 	Invalid T = iota
-	Ping      //心跳维护
-	Pong
 	Verify
 	On         //监听事件
-	Req        //请求,默认响应所有的,所有均没error,才代表这次调用成功了
-	ReqSomeOne //请求,一堆多的情况下,默认响应最快的那个结果
+	ReqAll     //请求所有监听者,等待所有响应,收集所有错误
+	ReqOne     //随机发送给一个监听者
+	ReqFirst   //发送给所有监听者,只接受第一个返回值
 	Res        //响应
-	ResSomeOne //响应
+	ResFirst   //第一个响应
 )
 
 var m = map[T]string{
-	Invalid:    "Invalid",
-	Ping:       "Ping",
-	Pong:       "Pong",
-	Verify:     "Verify",
-	On:         "On",
-	Req:        "Req",
-	ReqSomeOne: "ReqSomeOne",
-	Res:        "Res",
-	ResSomeOne: "ResSomeOne",
+	Invalid:  "Invalid",
+	Verify:   "Verify",
+	On:       "On",
+	ReqAll:   "ReqAll",
+	ReqOne:   "ReqOne",
+	ReqFirst: "ReqFirst",
+	Res:      "Res",
+	ResFirst: "ResFirst",
 }
 
 func (this T) String() string {
