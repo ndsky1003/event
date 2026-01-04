@@ -9,14 +9,14 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ndsky1003/event/v2"
-	"github.com/ndsky1003/event/v2/eventname"
+	"github.com/ndsky1003/event/v3"
+	"github.com/ndsky1003/event/v3/eventname"
 )
 
 var (
 	totalRequests atomic.Int64
-	totalErrors  atomic.Int64
-	totalSuccess atomic.Int64
+	totalErrors   atomic.Int64
+	totalSuccess  atomic.Int64
 )
 
 func main() {
@@ -29,7 +29,7 @@ func main() {
 	srv := event.NewServer(
 		event.ServerOptions().
 			SetSecret("test-secret").
-			SetTimeout(5*time.Second).
+			SetTimeout(5 * time.Second).
 			SetIsWrapError(false),
 	)
 	srv.Listen("127.0.0.1:8080")

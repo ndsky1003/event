@@ -3,9 +3,9 @@ package event
 import (
 	"reflect"
 
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 )
 
 // ============ Emit 方法 ============
@@ -111,7 +111,7 @@ func (this *Client) addHandlerInternal(t eventname.T, handler Handler) {
 	newtp := topic.New(t)
 	mType := &method{
 		handlerInterface: handler,
-		isHandler:       true,
+		isHandler:        true,
 	}
 
 	this.rwl.Lock()

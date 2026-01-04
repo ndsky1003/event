@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ndsky1003/event/v2/eventname"
+	"github.com/ndsky1003/event/v3/eventname"
 )
 
 func TestMain(m *testing.M) {
@@ -30,6 +30,6 @@ func BenchmarkEmit(b *testing.B) {
 	time.Sleep(1e8)
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-			_ = c.EmitOne(eventname.T("ppxia"), "lppp")
+		_ = c.EmitOne(eventname.T("ppxia"), "lppp")
 	}
 }

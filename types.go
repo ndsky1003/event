@@ -6,7 +6,7 @@ import (
 	"reflect"
 	"sync"
 
-	"github.com/ndsky1003/event/v2/msg"
+	"github.com/ndsky1003/event/v3/msg"
 	"github.com/tinylib/msgp/msgp"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -73,8 +73,8 @@ type method struct {
 	argsCount int
 
 	// 快速调用路径 - Handler 接口
-	handlerInterface any // Handler 接口实例
-	isHandler       bool // 是否使用 Handler 接口
+	handlerInterface any  // Handler 接口实例
+	isHandler        bool // 是否使用 Handler 接口
 
 	// 缓存优化
 	cachedArgs []reflect.Value // 预分配的参数

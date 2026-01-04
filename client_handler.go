@@ -7,11 +7,11 @@ import (
 	"log/slog"
 	"reflect"
 
-	"github.com/ndsky1003/event/v2/eventname"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 	"github.com/vmihailenco/msgpack/v5"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
 )
 
 // eventHandler 实现 conn.Handler 接口

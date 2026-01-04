@@ -3,7 +3,7 @@ package topic
 import (
 	"regexp"
 
-	"github.com/ndsky1003/event/v2/eventname"
+	"github.com/ndsky1003/event/v3/eventname"
 )
 
 // 引入这个概念是为了推广正则,有了正则就不用拓展组

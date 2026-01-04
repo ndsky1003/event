@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/ndsky1003/buffer"
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 	"github.com/ndsky1003/net/v2/client"
 	"github.com/ndsky1003/net/v2/conn"
 	"github.com/vmihailenco/msgpack/v5"
@@ -22,18 +22,18 @@ import (
 
 // Client 事件客户端
 type Client struct {
-	url      string
-	opt      *ClientOption
-	netCl    *client.Client
-	seq      uint64
+	url   string
+	opt   *ClientOption
+	netCl *client.Client
+	seq   uint64
 
 	rwl    sync.RWMutex
 	topics map[*topic.Topic][]*method
 
-	l             sync.Mutex
-	pending       map[uint64]*Call
-	registing     bool          // 是否正在注册 topics
-	registDoneCh  chan struct{} // 注册完成通知
+	l            sync.Mutex
+	pending      map[uint64]*Call
+	registing    bool          // 是否正在注册 topics
+	registDoneCh chan struct{} // 注册完成通知
 }
 
 // Dial 连接到服务器
@@ -207,8 +207,8 @@ func (c *Client) registTopic() {
 func (c *Client) registTopicLock() error {
 	// 先收集需要注册的 topics，避免持有锁时进行网络调用
 	type pendingTopic struct {
-		topic  *topic.Topic
-		name   eventname.T
+		topic *topic.Topic
+		name  eventname.T
 	}
 	var pending []pendingTopic
 

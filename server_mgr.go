@@ -13,9 +13,9 @@ import (
 
 	"github.com/antlabs/timer"
 	"github.com/google/uuid"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 	"github.com/ndsky1003/net/v2/server"
 	"github.com/vmihailenco/msgpack/v5"
 )
@@ -37,9 +37,9 @@ type eventServer struct {
 
 // server_call 服务端调用状态
 type server_call struct {
-	tn         timer.TimeNoder // 超时检测
-	originSid  uuid.UUID       // 原始的 sid
-	originSeq  uint64          // frame.需要改成服务器的 seq
+	tn        timer.TimeNoder // 超时检测
+	originSid uuid.UUID       // 原始的 sid
+	originSeq uint64          // frame.需要改成服务器的 seq
 
 	serverReqCount uint64
 	errs           []error
