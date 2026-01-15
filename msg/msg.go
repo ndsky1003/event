@@ -1,3 +1,4 @@
+//go:generate msgp --tests=false
 package msg
 
 import (
@@ -16,6 +17,8 @@ type MsgVerifyRes struct {
 	Err string
 }
 
+//msgp:replace eventname.T with:string
+//msgp:replace msgtype.T with:uint8
 type Msg struct {
 	T         msgtype.T
 	EventName eventname.T
@@ -31,4 +34,14 @@ func (this *Msg) String() string {
 		return ""
 	}
 	return fmt.Sprintf("%+v", *this)
+}
+
+func (this *Msg) Clear() {
+	this.T = msgtype.Invalid
+	this.EventName = ""
+	this.Seq = 0
+	this.Name = ""
+	this.BodyCount = 0
+	clear(this.Bytes)
+	this.Err = ""
 }

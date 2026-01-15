@@ -20,8 +20,8 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// eventServer 实现 server_manager 接口
-type eventServer struct {
+// server_mgr 实现 server_manager 接口
+type server_mgr struct {
 	opt *ServerOption
 
 	// 内部状态
@@ -32,7 +32,6 @@ type eventServer struct {
 	sessions map[uuid.UUID]server.Session // 保存 Session 引用
 	pending  map[uint64]*server_call
 	ctx      context.Context
-	cancel   context.CancelFunc
 }
 
 // server_call 服务端调用状态
@@ -45,78 +44,32 @@ type server_call struct {
 	errs           []error
 }
 
-// newEventServer 创建事件服务器
-func newEventServer(opts ...*ServerOption) *eventServer {
-	ctx, cancel := context.WithCancel(context.Background())
+// newServerMgr 创建事件服务器
+func newServerMgr(ctx context.Context, opts ...*ServerOption) *server_mgr {
 	opt := ServerOptions().
 		SetSecret("").
 		SetTimeout(10 * time.Second).
 		SetIsWrapError(true).
 		merges(opts...)
 
-	s := &eventServer{
+	s := &server_mgr{
 		opt:      opt,
 		tm:       timer.NewTimer(),
 		monitor:  make(map[*topic.Topic]map[uuid.UUID]struct{}),
 		sessions: make(map[uuid.UUID]server.Session),
 		pending:  make(map[uint64]*server_call),
 		ctx:      ctx,
-		cancel:   cancel,
 	}
 	go s.tm.Run()
 	return s
 }
 
-// OnConnect 连接建立时调用 - 验证逻辑
-func (s *eventServer) OnConnect(sess server.Session) error {
-	// 使用 conn.Write/Read/Flush 进行握手验证
-	c := sess.Conn()
-
-	// 1. 读取验证请求
-	data, err := c.Read()
-	if err != nil {
-		return fmt.Errorf("read verify request failed: %w", err)
-	}
-
-	// 2. 解码验证请求
-	verifyReq, err := decodeVerifyReq(data)
-	if err != nil {
-		return fmt.Errorf("decode verify request failed: %w", err)
-	}
-
-	// 3. 验证 secret
-	if *s.opt.Secret != "" && verifyReq.Secret != *s.opt.Secret {
-		verifyRes := &msg.MsgVerifyRes{Err: "invalid secret"}
-		data, _ = encodeVerifyRes(verifyRes)
-		c.Write(data)
-		c.Flush()
-		return errors.New("invalid secret")
-	}
-
-	// 4. 返回验证成功
-	verifyRes := &msg.MsgVerifyRes{}
-	data, err = encodeVerifyRes(verifyRes)
-	if err != nil {
-		return fmt.Errorf("encode verify response failed: %w", err)
-	}
-	if err := c.Write(data); err != nil {
-		return fmt.Errorf("write verify response failed: %w", err)
-	}
-	if err := c.Flush(); err != nil {
-		return fmt.Errorf("flush verify response failed: %w", err)
-	}
-
-	// 5. 保存 Session 引用
-	s.l.Lock()
-	s.sessions[sess.ID()] = sess
-	s.l.Unlock()
-
-	slog.Info("event service ready", "name", verifyReq.Name, "id", sess.ID())
+func (s *server_mgr) OnConnect(sess server.Session) error {
 	return nil
 }
 
 // OnMessage 收到消息时调用
-func (s *eventServer) OnMessage(sess server.Session, data []byte) error {
+func (s *server_mgr) OnMessage(sess server.Session, data []byte) error {
 	// 解码消息
 	m, err := decodeMsg(data)
 	if err != nil {
@@ -139,7 +92,7 @@ func (s *eventServer) OnMessage(sess server.Session, data []byte) error {
 }
 
 // OnDisconnect 连接断开时调用
-func (s *eventServer) OnDisconnect(sess server.Session, err error) error {
+func (s *server_mgr) OnDisconnect(sess server.Session, err error) error {
 	s.l.Lock()
 	defer s.l.Unlock()
 
@@ -158,7 +111,7 @@ func (s *eventServer) OnDisconnect(sess server.Session, err error) error {
 }
 
 // Close 关闭服务器
-func (s *eventServer) Close() error {
+func (s *server_mgr) Close() error {
 	s.cancel()
 	s.tm.Stop()
 	s.l.Lock()
@@ -172,7 +125,7 @@ func (s *eventServer) Close() error {
 // ============ 原有业务逻辑迁移 ============
 
 // on 处理订阅注册
-func (s *eventServer) on(sid uuid.UUID, frame *msg.Msg) {
+func (s *server_mgr) on(sid uuid.UUID, frame *msg.Msg) {
 	en := frame.EventName
 	s.l.Lock()
 	var isExist bool
@@ -194,7 +147,7 @@ func (s *eventServer) on(sid uuid.UUID, frame *msg.Msg) {
 }
 
 // req 处理请求
-func (s *eventServer) req(sid uuid.UUID, frame *msg.Msg) {
+func (s *server_mgr) req(sid uuid.UUID, frame *msg.Msg) {
 	et := frame.EventName
 	serverSeq := atomic.AddUint64(&s.seq, 1)
 	originSeq := frame.Seq
@@ -244,7 +197,7 @@ func (s *eventServer) req(sid uuid.UUID, frame *msg.Msg) {
 }
 
 // reqAll 发送给所有，等待所有响应
-func (s *eventServer) reqAll(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
+func (s *server_mgr) reqAll(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
 	sCall.serverReqCount = uint64(len(matchedSessions))
 
 	s.l.Lock()
@@ -263,7 +216,7 @@ func (s *eventServer) reqAll(matchedSessions []uuid.UUID, sCall *server_call, se
 }
 
 // reqOne 随机发送给一个监听者
-func (s *eventServer) reqOne(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
+func (s *server_mgr) reqOne(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
 	// 随机选择一个
 	randomIdx := rand.Intn(len(matchedSessions))
 	selectedSid := matchedSessions[randomIdx]
@@ -284,7 +237,7 @@ func (s *eventServer) reqOne(matchedSessions []uuid.UUID, sCall *server_call, se
 }
 
 // reqFirst 发送给所有，收到第一个响应就返回
-func (s *eventServer) reqFirst(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
+func (s *server_mgr) reqFirst(matchedSessions []uuid.UUID, sCall *server_call, serverSeq uint64, frame *msg.Msg, originSid uuid.UUID) {
 	sCall.serverReqCount = uint64(len(matchedSessions))
 
 	s.l.Lock()
@@ -303,7 +256,7 @@ func (s *eventServer) reqFirst(matchedSessions []uuid.UUID, sCall *server_call, 
 }
 
 // res 处理响应
-func (s *eventServer) res(sid uuid.UUID, m *msg.Msg) {
+func (s *server_mgr) res(sid uuid.UUID, m *msg.Msg) {
 	serverSeq := m.Seq
 	s.l.Lock()
 	sCall, ok := s.pending[serverSeq]
@@ -354,7 +307,7 @@ func (s *eventServer) res(sid uuid.UUID, m *msg.Msg) {
 }
 
 // writeToSession 向指定 session 发送消息
-func (s *eventServer) writeToSession(sid uuid.UUID, m *msg.Msg) {
+func (s *server_mgr) writeToSession(sid uuid.UUID, m *msg.Msg) {
 	s.l.Lock()
 	sess, ok := s.sessions[sid]
 	s.l.Unlock()
@@ -376,7 +329,7 @@ func (s *eventServer) writeToSession(sid uuid.UUID, m *msg.Msg) {
 }
 
 // releaseTimeout 处理超时
-func (s *eventServer) releaseTimeout(serverSeq uint64) {
+func (s *server_mgr) releaseTimeout(serverSeq uint64) {
 	s.l.Lock()
 	sCall, ok := s.pending[serverSeq]
 	if ok {

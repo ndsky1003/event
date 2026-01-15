@@ -44,11 +44,9 @@ func (this *Topic) GetEventName() eventname.T {
 }
 
 func (this *Topic) FindStringSubmatch(et eventname.T) []string {
-
 	if this.IsReg {
 		return this.reg.FindStringSubmatch(string(et))
 	} else {
 		return []string{string(et)}
 	}
-
 }

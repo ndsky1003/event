@@ -14,6 +14,7 @@ require (
 require (
 	github.com/antlabs/stl v0.0.2 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
+	github.com/ndsky1003/buffer/v3 v3.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/stretchr/testify v1.7.0 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect

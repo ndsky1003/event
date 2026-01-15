@@ -230,7 +230,7 @@ func decodeMsg(data []byte) (*msg.Msg, error) {
 // releaseMsg 释放消息到 pool
 func releaseMsg(m *msg.Msg) {
 	if m != nil {
-		*m = msg.Msg{}
+		m.Clear()
 		msgPool.Put(m)
 	}
 }

@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ndsky1003/buffer"
+	"github.com/ndsky1003/event/v3/buffer"
 	"github.com/ndsky1003/event/v3/eventname"
 	"github.com/ndsky1003/event/v3/msg"
 	"github.com/ndsky1003/event/v3/msgtype"
@@ -22,10 +22,10 @@ import (
 
 // Client 事件客户端
 type Client struct {
-	url   string
-	opt   *ClientOption
-	netCl *client.Client
-	seq   uint64
+	url    string
+	opt    *ClientOption
+	client *client.Client
+	seq    uint64
 
 	rwl    sync.RWMutex
 	topics map[*topic.Topic][]*method
@@ -64,7 +64,7 @@ func Dial(url string, opts ...*ClientOption) *Client {
 			WithConn(func(copt *conn.Option) {
 				// 设置 buffer 生成函数
 				copt.SetGenBufFn(func() []byte {
-					return make([]byte, 1024*4)
+					return buffer.Get()
 				})
 			}),
 	)
@@ -74,7 +74,7 @@ func Dial(url string, opts ...*ClientOption) *Client {
 		return c
 	}
 
-	c.netCl = netCl
+	c.client = netCl
 	go func() {
 		<-ctx.Done()
 		c.Stop(context.Canceled)
@@ -255,7 +255,7 @@ func (c *Client) Write(m *msg.Msg) error {
 }
 
 func (c *Client) write(m *msg.Msg) error {
-	if c.netCl == nil || !c.netCl.IsConnected() {
+	if c.client == nil || !c.client.IsConnected() {
 		return ErrNoConnect
 	}
 
@@ -268,7 +268,7 @@ func (c *Client) write(m *msg.Msg) error {
 	// 发送
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return c.netCl.Send(ctx, data)
+	return c.client.Send(ctx, data)
 }
 
 // emitAsync 异步发送
@@ -325,8 +325,8 @@ func (c *Client) send(call *Call) {
 	c.pending[seq] = call
 	call.Msg.Seq = seq
 
-	if c.netCl == nil || !c.netCl.IsConnected() {
-		err = fmt.Errorf("%w %w connecting:%v", ErrClient, ErrNoConnect, c.netCl != nil && c.netCl.IsConnected())
+	if c.client == nil || !c.client.IsConnected() {
+		err = fmt.Errorf("%w %w connecting:%v", ErrClient, ErrNoConnect, c.client != nil && c.client.IsConnected())
 	}
 
 	if err == nil {
