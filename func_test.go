@@ -1,31 +1,27 @@
 package event
 
 import (
-	"reflect"
+	"math"
 	"testing"
 )
 
-func Test_incSeqID(t *testing.T) {
-	type args struct {
-		seq uint64
-	}
+func TestIncSeqID(t *testing.T) {
 	tests := []struct {
 		name string
-		args func(t *testing.T) args
-
-		want1 uint64
+		in   uint64
+		want uint64
 	}{
-		//TODO: Add test cases
+		{name: "zero", in: 0, want: 1},
+		{name: "one", in: 1, want: 2},
+		{name: "normal", in: 100, want: 101},
+		{name: "max wraps to 1", in: math.MaxUint64, want: 1},
+		{name: "just below max", in: math.MaxUint64 - 1, want: math.MaxUint64},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			tArgs := tt.args(t)
-
-			got1 := incSeqID(tArgs.seq)
-
-			if !reflect.DeepEqual(got1, tt.want1) {
-				t.Errorf("incSeqID got1 = %v, want1: %v", got1, tt.want1)
+			if got := incSeqID(tt.in); got != tt.want {
+				t.Errorf("incSeqID(%d) = %d, want %d", tt.in, got, tt.want)
 			}
 		})
 	}

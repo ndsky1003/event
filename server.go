@@ -263,7 +263,9 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 			if reqMeta.existErr {
 				msg.Error = strings.Join(reqMeta.errs, ";")
 			}
+			this.mutex.RLock()
 			err := this.write(reqMeta.reqServerID, msg)
+			this.mutex.RUnlock()
 			this.mutex.Lock()
 			if err != nil {
 				logrus.Errorf("res senderID:%d,msg:%+v", reqMeta.reqServerID, msg)
@@ -339,7 +341,9 @@ func (this *service) serve() {
 			}
 		}
 	}
+	this.server.mutex.Lock()
 	this.server.close(this.id)
+	this.server.mutex.Unlock()
 	logrus.Errorf("service id:%d is die,err:%v\n", this.id, err)
 }
 
