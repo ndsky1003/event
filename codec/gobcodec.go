@@ -42,7 +42,7 @@ func (this *gobCodeC) Write(m *msg.Msg) (err error) {
 }
 
 func (this *gobCodeC) Close() error {
-	if this == nil {
+	if this == nil || this.conn == nil {
 		return nil
 	}
 	return this.conn.Close()
