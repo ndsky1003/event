@@ -29,9 +29,9 @@ func TestClientOptionsSetAndMerge(t *testing.T) {
 
 func TestClientOptionsMergeNilSafe(t *testing.T) {
 	opt := Client()
-	opt.Merge()
+	opt.Merge(nil)
 	if opt.Name != nil || opt.CodecFunc != nil || opt.CheckInterval != nil {
-		t.Errorf("Merge() with no args should not modify options")
+		t.Errorf("Merge(nil) should not modify options")
 	}
 }
 
@@ -66,8 +66,8 @@ func TestServerOptionsSetAndMerge(t *testing.T) {
 
 func TestServerOptionsMergeNilSafe(t *testing.T) {
 	opt := Server()
-	opt.Merge()
+	opt.Merge(nil)
 	if opt.ReqTimeout != nil || opt.CodecFunc != nil {
-		t.Errorf("Merge() with no args should not modify options")
+		t.Errorf("Merge(nil) should not modify options")
 	}
 }

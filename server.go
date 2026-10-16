@@ -269,7 +269,7 @@ func (this *server) res(serviceID uint64, serviceName string, msg *msg.Msg) {
 			this.mutex.Lock()
 			if err != nil {
 				logrus.Errorf("res senderID:%d,msg:%+v", reqMeta.reqServerID, msg)
-				this.close(serviceID)
+				this.close(reqMeta.reqServerID)
 			}
 			delete(this.reqMetas, reqSeq)
 			this.mutex.Unlock()

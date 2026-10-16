@@ -1,0 +1,4 @@
+所以答案是：测试确实暴露了 bug，只是我当时处理错了方向。总结：
+1. Merge(nil) panic（真实 bug）：clientOptions.go / serverOptions.go 的 merge 方法缺少 nil 判断，Merge(nil) 会空指针 panic。我最初写测试时踩到了，却把测试改成 Merge() 绕了过去——这是错误的。现在已在 merge 里加 if opt == nil { return } 修复，测试也改回传 nil 了。
+2. close(serviceID) 用错对象（真实 bug）：server.go:272 写响应失败时，日志记录的是请求方 reqMeta.reqServerID，却 close 了响应方 serviceID，逻辑不一致。已改为 close(reqMeta.reqServerID)。
+其余测试（并发断开、并发 Emit、正则、多监听等）是回归验证，确认之前的并发 map 修复没有引入新问题，目前都通过 go test -race。

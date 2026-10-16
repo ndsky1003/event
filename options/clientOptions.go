@@ -65,6 +65,9 @@ func (this *ClientOptions) Merge(opts ...*ClientOptions) *ClientOptions {
 }
 
 func (this *ClientOptions) merge(opt *ClientOptions) {
+	if opt == nil {
+		return
+	}
 	if opt.Name != nil {
 		this.Name = opt.Name
 	}

@@ -26,6 +26,9 @@ func (this *ServerOptions) Merge(opts ...*ServerOptions) *ServerOptions {
 }
 
 func (this *ServerOptions) merge(opt *ServerOptions) {
+	if opt == nil {
+		return
+	}
 	if opt.CodecFunc != nil {
 		this.CodecFunc = opt.CodecFunc
 	}
