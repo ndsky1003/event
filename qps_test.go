@@ -50,6 +50,9 @@ func measureQPS(t *testing.T, url string, listeners, emitters int, duration time
 }
 
 func TestQPS(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过耗时 QPS 压力测试,用 go test -run TestQPS -v 显式运行")
+	}
 	url := startServer(t)
 
 	scenarios := []struct {
