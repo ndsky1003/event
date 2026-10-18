@@ -43,7 +43,7 @@ func NewServer(opts ...*options.ServerOptions) *server {
 	c := &server{
 		services:   map[uint64]*service{},
 		monitor:    map[*msg.EventTopic]map[uint64]struct{}{},
-		reqTimeOut: 10,
+		reqTimeOut: 10 * time.Second,
 		reqMetas:   map[uint64]*serverReqMeta{},
 	}
 
@@ -114,7 +114,7 @@ func (this *server) checkTimeOut() {
 	for {
 		this.mutex.Lock()
 		for _, reqMeta := range this.reqMetas {
-			if time.Now().Sub(reqMeta.Time) > this.reqTimeOut*time.Second { //
+			if time.Now().Sub(reqMeta.Time) > this.reqTimeOut { //
 				gotMsg := &msg.Msg{
 					T:         msg.MsgType_res,
 					ServerSeq: reqMeta.serverReqSeq,
@@ -244,6 +244,10 @@ func (this *server) req(serviceID uint64, frame *msg.Msg) {
 			res.Error = strings.Join(reqMeta.errs, ";")
 		}
 		this.write(reqMeta.reqServerID, res)
+		delete(this.reqMetas, serverSeq)
+	} else if !isDone {
+		// 无监听者:已在上面回写响应,这里清理 reqMeta,避免残留到超时
+		delete(this.reqMetas, serverSeq)
 	}
 }
 

@@ -40,6 +40,7 @@ type Client struct {
 	heartInterval time.Duration //心跳间隔
 	isStopHeart   bool          //是否关闭心跳
 	connecting    bool          // client is connecting
+	done          chan struct{} // 关闭信号
 }
 
 func Dial(url string, opts ...*options.ClientOptions) *Client {
@@ -49,6 +50,7 @@ func Dial(url string, opts ...*options.ClientOptions) *Client {
 		pending:       make(map[uint64]*msg.Call),
 		checkInterval: 1,
 		heartInterval: 5,
+		done:          make(chan struct{}),
 	}
 	//合并属性
 	opt := options.Client().SetCodecFunc(func(conn io.ReadWriteCloser) (codec.Codec, error) {
@@ -86,6 +88,11 @@ func (this *Client) getConnecting() bool {
 
 func (this *Client) keepAlive() {
 	for {
+		select {
+		case <-this.done:
+			return
+		default:
+		}
 		if !this.getConnecting() {
 			conn, err := net.Dial("tcp", this.url)
 			if err != nil {
@@ -175,6 +182,27 @@ func (this *Client) StopHeart() {
 	defer this.mutex.Unlock()
 	this.isStopHeart = true
 
+}
+
+// Close 关闭客户端:停止心跳与自动重连,释放连接与后台 goroutine。
+// 调用后不可再复用该 Client。
+func (this *Client) Close() {
+	if this == nil {
+		return
+	}
+	this.mutex.Lock()
+	if this.done == nil {
+		this.done = make(chan struct{})
+	}
+	select {
+	case <-this.done:
+		this.mutex.Unlock()
+		return
+	default:
+		close(this.done)
+	}
+	this.mutex.Unlock()
+	this.stop(errors.New("client closed"))
 }
 
 func (this *Client) PrintCall() {
