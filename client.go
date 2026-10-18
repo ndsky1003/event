@@ -272,7 +272,15 @@ func (this *Client) call(codec codec.Codec, req *msg.Msg) {
 			if tp.IsRegexp {
 				args = append([]reflect.Value{reflect.ValueOf(tp.FindStringSubmatch(et))}, args...)
 			}
-			returnValues := method.function.Call(args)
+			returnValues, callErr := safeCall(method.function, args, tp.GetEventType(), et)
+			if callErr != nil {
+				if err != nil {
+					err = fmt.Errorf("%w,%w", err, callErr)
+				} else {
+					err = callErr
+				}
+				continue
+			}
 			errInter := returnValues[0].Interface()
 			if errInter != nil {
 				appendErr := errInter.(error)
@@ -294,6 +302,17 @@ func (this *Client) call(codec codec.Codec, req *msg.Msg) {
 	if err != nil {
 		this.stop(err)
 	}
+}
+
+// safeCall 反射调用回调,捕获 panic 转为 error,避免回调内部 panic 拖垮整个进程。
+func safeCall(fn reflect.Value, args []reflect.Value, topic, et msg.EventType) (ret []reflect.Value, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("[topic:%v,event:%s] handler panic: %v", topic, et, r)
+		}
+	}()
+	ret = fn.Call(args)
+	return ret, nil
 }
 
 var errType = reflect.TypeOf((*error)(nil)).Elem()
