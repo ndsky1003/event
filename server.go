@@ -199,73 +199,55 @@ func (this *server) req(serviceID uint64, frame *msg.Msg) {
 	}
 	this.reqMetas[serverSeq] = reqMeta
 	this.mutex.Unlock()
-
-	// 读锁只做纯内存读:收集要广播的监听者 sid 列表(不再在锁内做网络写)
 	this.mutex.RLock()
-	var sids []uint64
-	seen := map[uint64]struct{}{}
+	var isDone bool
+	var needDeleteServiceID []uint64
+	var hasSendServiceID = map[uint64]struct{}{}
 	for tp, v := range this.monitor {
 		if tp.Match(et) {
 			for sid := range v {
-				if _, ok := seen[sid]; !ok {
-					seen[sid] = struct{}{}
-					sids = append(sids, sid)
+				if _, ok := hasSendServiceID[sid]; !ok {
+					if err := this.write(sid, frame); err == nil {
+						hasSendServiceID[sid] = struct{}{}
+						isDone = true
+						reqMeta.serverReqCount++
+					} else {
+						reqMeta.serverReqCount--
+						needDeleteServiceID = append(needDeleteServiceID, sid)
+					}
 				}
 			}
 		}
 	}
-	this.mutex.RUnlock()
-
-	if len(sids) == 0 {
-		// 无监听者:回写空响应并清理
-		this.mutex.Lock()
+	if !isDone {
 		frame.T = msg.MsgType_res
 		frame.Bytes = nil
 		frame.BodyCount = 0
-		this.write(serviceID, frame)
-		delete(this.reqMetas, serverSeq)
-		this.mutex.Unlock()
-		return
-	}
-
-	// 写前预置等待计数,保证监听者响应(res)能正确递减,避免提前递减的竞态
-	this.mutex.Lock()
-	reqMeta.serverReqCount = uint64(len(sids))
-	this.mutex.Unlock()
-
-	// 锁外做网络写(广播给各监听者)
-	var failedSids []uint64
-	for _, sid := range sids {
-		if err := this.write(sid, frame); err != nil {
-			failedSids = append(failedSids, sid)
+		if err := this.write(serviceID, frame); err != nil {
+			needDeleteServiceID = append(needDeleteServiceID, serviceID)
 		}
 	}
-
+	this.mutex.RUnlock()
 	this.mutex.Lock()
 	defer this.mutex.Unlock()
-	for _, sid := range failedSids {
+	for _, sid := range needDeleteServiceID {
 		this.close(sid)
 	}
-	if n := uint64(len(failedSids)); n > 0 {
-		if reqMeta.serverReqCount >= n {
-			reqMeta.serverReqCount -= n
-		} else {
-			reqMeta.serverReqCount = 0
+	if isDone && reqMeta.serverReqCount == 0 { //接收比较快
+		res := &msg.Msg{
+			T:         msg.MsgType_res,
+			ServerSeq: serverSeq,
+			ClientSeq: frame.ClientSeq,
+			EventType: frame.EventType,
 		}
-		// 修正后归零,说明所有成功监听者均已响应,立即回写最终响应
-		if reqMeta.serverReqCount == 0 {
-			res := &msg.Msg{
-				T:         msg.MsgType_res,
-				ServerSeq: serverSeq,
-				ClientSeq: frame.ClientSeq,
-				EventType: frame.EventType,
-			}
-			if reqMeta.existErr {
-				res.Error = strings.Join(reqMeta.errs, ";")
-			}
-			this.write(reqMeta.reqServerID, res)
-			delete(this.reqMetas, serverSeq)
+		if reqMeta.existErr {
+			res.Error = strings.Join(reqMeta.errs, ";")
 		}
+		this.write(reqMeta.reqServerID, res)
+		delete(this.reqMetas, serverSeq)
+	} else if !isDone {
+		// 无监听者:已在上面回写响应,这里清理 reqMeta,避免残留到超时
+		delete(this.reqMetas, serverSeq)
 	}
 }
 
