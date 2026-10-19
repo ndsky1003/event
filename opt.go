@@ -2,6 +2,8 @@ package event
 
 import (
 	"time"
+
+	"github.com/ndsky1003/event/v2/coder"
 )
 
 type ClientOption struct {
@@ -10,6 +12,7 @@ type ClientOption struct {
 	check_interval *time.Duration //链接检测,不能说断链了就马上去连,这会造成不必要的资源消耗
 	heart_interval *time.Duration //心跳检测的间隔
 	is_wrap_error  *bool
+	coder_type     *coder.T //事件参数的编码方式,默认为 Msgp
 }
 
 func ClientOptions() *ClientOption {
@@ -55,6 +58,15 @@ func (this *ClientOption) SetIsWrapError(b bool) *ClientOption {
 	return this
 }
 
+// SetCoderType 设置事件参数的编码方式（Raw/JSON/Msgp），默认为 Msgp。
+func (this *ClientOption) SetCoderType(t coder.T) *ClientOption {
+	if this == nil {
+		return this
+	}
+	this.coder_type = &t
+	return this
+}
+
 func (this *ClientOption) merges(opts ...*ClientOption) *ClientOption {
 	for _, opt := range opts {
 		this.merge(opt)
@@ -84,6 +96,10 @@ func (this *ClientOption) merge(opt *ClientOption) {
 
 	if opt.is_wrap_error != nil {
 		this.is_wrap_error = opt.is_wrap_error
+	}
+
+	if opt.coder_type != nil {
+		this.coder_type = opt.coder_type
 	}
 }
 

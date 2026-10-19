@@ -19,8 +19,6 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var argCoder = coder.New()
-
 var bodyPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 0, 1024)
@@ -37,6 +35,7 @@ type Client struct {
 	seq       uint64
 	opt       *ClientOption
 	codecFunc codec.CreateCodecFunc
+	coderType coder.T //事件参数的编码方式,可通过 ClientOption.SetCoderType 注入
 
 	rwl    sync.RWMutex // protect under ,这个显然是读大于写,写只有on的时候用
 	topics map[*topic.Topic][]*method
@@ -55,6 +54,7 @@ func Dial(url string, opts ...*ClientOption) *Client {
 		codecFunc: func(conn io.ReadWriteCloser) (codec.Codec, error) {
 			return codec.NewGobCodec(conn), nil
 		},
+		coderType: coder.Msgp,
 	}
 	c.opt = ClientOptions().
 		SetName("").
@@ -63,6 +63,9 @@ func Dial(url string, opts ...*ClientOption) *Client {
 		SetSecret("").
 		SetIsWrapError(true).
 		merges(opts...)
+	if c.opt.coder_type != nil {
+		c.coderType = *c.opt.coder_type
+	}
 	go c.keepAlive()
 	return c
 }
@@ -210,14 +213,14 @@ func (this *Client) input(codec codec.Codec) {
 	this.Stop(err)
 }
 
-func (this *Client) parse(req_body_data []byte, req_args_count int, m *method) (argsValue []reflect.Value, err error) {
+func (this *Client) parse(coderType coder.T, req_body_data []byte, req_args_count int, m *method) (argsValue []reflect.Value, err error) {
 	argsValue = make([]reflect.Value, m.argsCount)
 	rest := req_body_data
 	for i := 0; i < m.argsCount; i++ {
 		argType := m.argsType[i]
 		argValue := reflect.New(argType.at)
 		if i < req_args_count {
-			if rest, err = argCoder.Decode(rest, argValue.Interface()); err != nil {
+			if rest, err = coder.Unmarshal(coderType, rest, argValue.Interface()); err != nil {
 				ft := m.function.Type()
 				err = fmt.Errorf("%w,parse func[%v] body [%v] arg err:%w", ErrClient, ft, i, err)
 				return
@@ -253,7 +256,7 @@ func (this *Client) func_call(req *msg.Msg) {
 		var errs []error
 		for tp, methods := range topics_tmp {
 			for _, method := range methods {
-				args, err := this.parse(req.Bytes, int(req.BodyCount), method)
+				args, err := this.parse(req.Coder, req.Bytes, int(req.BodyCount), method)
 				if err != nil {
 					errs = append(errs, err)
 					continue
@@ -335,6 +338,7 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		T:         t,
 		EventName: en,
 		BodyCount: int8(len(args)),
+		Coder:     this.coderType,
 	}
 	call = NewCall(m)
 	if m.EventName == "" {
@@ -345,7 +349,7 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		body := bodyPool.Get().([]byte)[:0]
 		var err error
 		for _, arg := range args {
-			if body, err = argCoder.Encode(body, arg); err != nil {
+			if body, err = coder.Encode(m.Coder, body, arg); err != nil {
 				err = fmt.Errorf("%w %w current err:%w", ErrClient, ErrClientEncode, err)
 				break
 			}

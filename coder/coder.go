@@ -1,56 +1,74 @@
 package coder
 
 import (
-	"bytes"
-	"reflect"
-
-	"github.com/tinylib/msgp/msgp"
-	"github.com/vmihailenco/msgpack/v5"
+	"errors"
+	"fmt"
 )
 
-// Coder 是事件参数的编解码器：优先走 msgp 快路径，否则回退到 msgpack 反射编码。
-type Coder struct{}
-
-func New() *Coder { return &Coder{} }
-
-// Encode 编码单个参数 v 追加到 b，返回追加后的切片。
-// msgp 快路径：m.MarshalMsg(b) 直接 append（b 容量够则零分配）；
-// nil 指针及未 codegen 的类型回退到 vmihailenco/msgpack。
-// 两者均产出标准 MessagePack 字节（struct 默认 map 格式），可互通。
-func (c *Coder) Encode(b []byte, v any) ([]byte, error) {
-	if m, ok := v.(msgp.Marshaler); ok && !isNilPtr(v) {
-		return m.MarshalMsg(b)
-	}
-	var buf bytes.Buffer
-	enc := msgpack.GetEncoder()
-	enc.Reset(&buf)
-	err := enc.Encode(v)
-	msgpack.PutEncoder(enc)
-	if err != nil {
-		return nil, err
-	}
-	return append(b, buf.Bytes()...), nil
-}
-
+// Coder 是事件参数的编解码器接口。
+//
+// Encode 把单个参数 v 追加编码到 b，返回追加后的切片；
 // Decode 从 b 解码一个参数到 v，返回剩余字节。
-// 不能用 msgp.Decodable（DecodeMsg 内部走 fwd.Reader 缓冲，连续解码会预读丢字节），
-// 必须用 msgp.Unmarshaler（UnmarshalMsg 基于 []byte、返回剩余字节）。
-func (c *Coder) Decode(b []byte, v any) ([]byte, error) {
-	if m, ok := v.(msgp.Unmarshaler); ok {
-		return m.UnmarshalMsg(b)
-	}
-	reader := bytes.NewReader(b)
-	dec := msgpack.GetDecoder()
-	dec.Reset(reader)
-	err := dec.Decode(v)
-	msgpack.PutDecoder(dec)
-	if err != nil {
-		return nil, err
-	}
-	return b[len(b)-reader.Len():], nil
+//
+// 实现方需保证：用同一 Coder 连续 Encode 出的一批字节，能被同一 Coder
+// 连续 Decode 按序还原（每个参数一一对应）。编码端与解码端必须使用一致的
+// 线协议（如 msgpack、json 等）。
+type Coder interface {
+	Encode(b []byte, v any) ([]byte, error)
+	Decode(b []byte, v any) ([]byte, error)
 }
 
-func isNilPtr(v any) bool {
-	rv := reflect.ValueOf(v)
-	return rv.Kind() == reflect.Pointer && rv.IsNil()
+type T uint8
+
+const (
+	Raw T = iota
+	JSON
+	Msgp
+)
+
+func (t T) String() string {
+	switch t {
+	case Raw:
+		return "Raw"
+	case JSON:
+		return "JSON"
+	case Msgp:
+		return "Msgp"
+	default:
+		return "unknown"
+	}
+}
+
+func RegisterCoder(t T, coder Coder) {
+	coders[t] = coder
+}
+
+var coders = map[T]Coder{
+	Raw:  new_raw_coder(),
+	JSON: new_json_coder(),
+	Msgp: new_msgpack_coder(),
+}
+
+// Encode 根据类型标记 t 选择 coder，把 v 追加编码到 data 并返回。
+func Encode(t T, data []byte, v any) (ret []byte, err error) {
+	coder, ok := coders[t]
+	if !ok {
+		err = fmt.Errorf("coder:%v is not exist", t)
+		return
+	}
+	return coder.Encode(data, v)
+}
+
+// Unmarshal 根据类型标记 t 选择 coder，从 data 解码一个参数到 v，返回剩余字节。
+func Unmarshal(t T, data []byte, v any) (ret []byte, err error) {
+	if v == nil {
+		err = errors.New("decode obj v is nil")
+		return
+	}
+	coder, ok := coders[t]
+	if !ok {
+		err = fmt.Errorf("coder:%v is not exist", t)
+		return
+	}
+	return coder.Decode(data, v)
 }

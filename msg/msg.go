@@ -3,6 +3,7 @@ package msg
 import (
 	"fmt"
 
+	"github.com/ndsky1003/event/v2/coder"
 	"github.com/ndsky1003/event/v2/eventname"
 	"github.com/ndsky1003/event/v2/msgtype"
 )
@@ -21,7 +22,8 @@ type Msg struct {
 	EventName eventname.T
 	Seq       uint64 //本地请求序号
 	Name      string
-	BodyCount int8 // 超过这个数就是自讨苦吃
+	BodyCount int8     // 超过这个数就是自讨苦吃
+	Coder     coder.T  //参数编码方式（Raw/JSON/Msgp）
 	Bytes     []byte
 	Err       string // error
 }
