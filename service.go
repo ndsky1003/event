@@ -53,7 +53,7 @@ func (this *service) serve() {
 		case msgtype.Ping:
 			retFrame := &msg.Msg{T: msgtype.Pong, Seq: frame.Seq}
 			this.Write(retFrame)
-		case msgtype.On, msgtype.Req, msgtype.ReqSomeOne, msgtype.Res, msgtype.ResSomeOne:
+		case msgtype.On, msgtype.Req, msgtype.ReqRandOne, msgtype.Res, msgtype.ResRandOne:
 			go this.server.handle(this.id, this.name, &frame)
 		default:
 			logrus.Infof("%v,invalid msg:%+v", ErrServer, frame)

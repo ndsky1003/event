@@ -11,6 +11,5 @@ type method struct {
 }
 
 type argType struct {
-	isPointer bool
-	at        reflect.Type
+	at reflect.Type
 }

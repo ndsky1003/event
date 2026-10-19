@@ -11,9 +11,9 @@ const (
 	Verify
 	On         //监听事件
 	Req        //请求,默认响应所有的,所有均没error,才代表这次调用成功了
-	ReqSomeOne //请求,一堆多的情况下,默认响应最快的那个结果
+	ReqRandOne //请求,一堆多的情况下,默认响应最快的那个结果
 	Res        //响应
-	ResSomeOne //响应
+	ResRandOne //响应
 )
 
 var m = map[T]string{
@@ -23,9 +23,9 @@ var m = map[T]string{
 	Verify:     "Verify",
 	On:         "On",
 	Req:        "Req",
-	ReqSomeOne: "ReqSomeOne",
+	ReqRandOne: "ReqRandOne",
 	Res:        "Res",
-	ResSomeOne: "ResSomeOne",
+	ResRandOne: "ResRandOne",
 }
 
 func (this T) String() string {

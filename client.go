@@ -1,8 +1,6 @@
 package event
 
 import (
-	"bytes"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -12,14 +10,23 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ndsky1003/buffer"
 	"github.com/ndsky1003/event/v2/codec"
+	"github.com/ndsky1003/event/v2/coder"
 	"github.com/ndsky1003/event/v2/eventname"
 	"github.com/ndsky1003/event/v2/msg"
 	"github.com/ndsky1003/event/v2/msgtype"
 	"github.com/ndsky1003/event/v2/topic"
 	"github.com/sirupsen/logrus"
 )
+
+var argCoder = coder.New()
+
+var bodyPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, 1024)
+		return b
+	},
+}
 
 func init() {
 	logrus.SetReportCaller(true)
@@ -177,9 +184,9 @@ func (this *Client) input(codec codec.Codec) {
 		}
 		switch gotMsg.T {
 		case msgtype.Ping:
-		case msgtype.Req, msgtype.ReqSomeOne:
+		case msgtype.Req, msgtype.ReqRandOne:
 			go this.func_call(&gotMsg)
-		case msgtype.Res, msgtype.ResSomeOne, msgtype.On, msgtype.Pong:
+		case msgtype.Res, msgtype.ResRandOne, msgtype.On, msgtype.Pong:
 			seq := gotMsg.Seq
 			this.l.Lock()
 			call := this.pending[seq]
@@ -205,25 +212,18 @@ func (this *Client) input(codec codec.Codec) {
 
 func (this *Client) parse(req_body_data []byte, req_args_count int, m *method) (argsValue []reflect.Value, err error) {
 	argsValue = make([]reflect.Value, m.argsCount)
-	dec := gob.NewDecoder(bytes.NewReader(req_body_data))
+	rest := req_body_data
 	for i := 0; i < m.argsCount; i++ {
 		argType := m.argsType[i]
-		at := argType.at
-		if argType.isPointer {
-			at = at.Elem()
-		}
-		argValue := reflect.New(at)
+		argValue := reflect.New(argType.at)
 		if i < req_args_count {
-			if err = dec.Decode(argValue.Interface()); err != nil {
+			if rest, err = argCoder.Decode(rest, argValue.Interface()); err != nil {
 				ft := m.function.Type()
 				err = fmt.Errorf("%w,parse func[%v] body [%v] arg err:%w", ErrClient, ft, i, err)
 				return
 			}
 		}
-		if !argType.isPointer {
-			argValue = argValue.Elem()
-		}
-		argsValue[i] = argValue
+		argsValue[i] = argValue.Elem()
 	}
 	return
 }
@@ -231,8 +231,8 @@ func (this *Client) parse(req_body_data []byte, req_args_count int, m *method) (
 func (this *Client) func_call(req *msg.Msg) {
 	et := req.EventName
 	t := msgtype.Res
-	if req.T == msgtype.ReqSomeOne {
-		t = msgtype.ResSomeOne
+	if req.T == msgtype.ReqRandOne {
+		t = msgtype.ResRandOne
 	}
 	res := &msg.Msg{
 		T:         t,
@@ -342,22 +342,23 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, args ...any) (call *
 		call.done()
 	}
 	if len(args) > 0 {
-		buf := buffer.Get()
-		defer buf.Release()
-		paramEncoder := gob.NewEncoder(buf)
+		body := bodyPool.Get().([]byte)[:0]
 		var err error
 		for _, arg := range args {
-			if err = paramEncoder.Encode(arg); err != nil {
+			if body, err = argCoder.Encode(body, arg); err != nil {
 				err = fmt.Errorf("%w %w current err:%w", ErrClient, ErrClientEncode, err)
 				break
 			}
 		}
 		if err != nil {
+			bodyPool.Put(body[:0])
 			call.Err = err
 			call.done()
 			return
 		}
-		m.Bytes = buf.Bytes()
+		m.Bytes = make([]byte, len(body))
+		copy(m.Bytes, body)
+		bodyPool.Put(body[:0])
 	}
 	this.send(call)
 	return

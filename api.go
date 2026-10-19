@@ -17,11 +17,11 @@ func (this *Client) EmitAsync(en eventname.T, args ...any) (call *Call) {
 }
 
 func (this *Client) EmitSomeOne(en eventname.T, args ...any) error {
-	return this.emit(msgtype.ReqSomeOne, en, args...)
+	return this.emit(msgtype.ReqRandOne, en, args...)
 }
 
 func (this *Client) EmitSomeOneAsnyc(en eventname.T, args ...any) *Call {
-	return this.emit_async(msgtype.ReqSomeOne, en, args...)
+	return this.emit_async(msgtype.ReqRandOne, en, args...)
 }
 
 // 监听事件
@@ -58,7 +58,7 @@ func (this *Client) On(t eventname.T, Func any) {
 	var argsType = make([]*argType, 0, inCount)
 	for i := inStart; i < length; i++ {
 		at := rt.In(i)
-		argsType = append(argsType, &argType{isPointer: at.Kind() == reflect.Pointer, at: at})
+		argsType = append(argsType, &argType{at: at})
 	}
 	ft := reflect.ValueOf(Func)
 	mType := &method{

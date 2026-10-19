@@ -162,9 +162,9 @@ func (this *server) handle(sid uint32, sname string, frame *msg.Msg) {
 	switch frame.T {
 	case msgtype.On:
 		this.on(sid, frame)
-	case msgtype.Req, msgtype.ReqSomeOne:
+	case msgtype.Req, msgtype.ReqRandOne:
 		this.req(sid, frame)
-	case msgtype.Res, msgtype.ResSomeOne:
+	case msgtype.Res, msgtype.ResRandOne:
 		this.res(sid, sname, frame)
 	default:
 		logrus.Infof("丢弃：%d,name:%v,msg:%+v\n", sid, sname, frame)
@@ -251,7 +251,7 @@ func (this *server) res(_ uint32, serviceName string, msg *msg.Msg) {
 			}
 			s_call.errs = append(s_call.errs, ee)
 		}
-		if leftCount == 0 || msg.T == msgtype.ResSomeOne { //res
+		if leftCount == 0 || msg.T == msgtype.ResRandOne { //res
 			if len(s_call.errs) > 0 {
 				msg.Err = errors.Join(s_call.errs...).Error()
 			}
@@ -263,7 +263,7 @@ func (this *server) res(_ uint32, serviceName string, msg *msg.Msg) {
 		}
 	}
 	this.l.Unlock()
-	if ok && (s_call.serverReqCount == 0 || msg.T == msgtype.ResSomeOne) {
+	if ok && (s_call.serverReqCount == 0 || msg.T == msgtype.ResRandOne) {
 		this.write(s_call.origin_sid, msg)
 	}
 }
