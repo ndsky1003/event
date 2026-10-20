@@ -50,4 +50,7 @@ go vet ./...
 - 错误会默认被包装（`SetIsWrapError`，默认 `true`），用 `errors.Is` 判断时注意包装链上的 `ErrClient`/`ErrServer`/`ErrConnClosed` 等哨兵错误（定义在 `err.go`）。
 - `msg.Msg` 上的 `msgpack:"..."` tag **就是线上协议**：msgpack map 格式每条消息都带字段名，短 tag 一条省 50 字节上下。字段名对不上时解码端**不报错、只静默丢字段**，所以两端必须同源。实测 tinylib/msgp codegen 只认 `msgpack:"..."`（忽略 `msgp:"..."` 和 `json:"..."`），所以给 `msg.Msg` 跑 codegen 不会改变线上格式。
 - `Client` 的锁顺序固定为 `rwl -> l`：持 `l` 的路径绝不再去拿 `rwl`，否则与 `On`/`regist_topic_lock`/`Stop` 交叉死锁。
+- **吞吐瓶颈是 syscall，不是序列化**：饱和点 profile 里 `writev`+`read` 占 86%，编码/锁/reflect 加起来不到 3%。同步 `Emit` 是 stop-and-wait，`QPS = 在途并发 / 往返延迟`，`net.Buffers` 平均只攒到 1.18 帧（无货可攒）。要提吞吐靠 `EmitAsync` 流水线（batch 升到 5.86、QPS ×2~3）或加并发，**别去抠编码和拷贝**。实测数字见 `TODO.md` 性能第 5 条。
+- **`Conn.r`（`bufio.Reader`）不能去，读侧的 copy 也别抠**：去掉 bufio 每帧多 2 次 syscall，实测吞吐 **-10%~-16%**；反过来把 bufio 的 copy + `make([]byte, size)` 全干掉（复用缓冲，忽略正确性）端到端只有 **-0.5%~+1.8%**，在 4% 噪声底里。真要做零拷贝读得先解决 `clientConn.HandleMsg` 里 `go func_call` 留存 `body` 的问题，收益 <4%，不划算。
+- **压测方法学**：单进程跑（服务端 + 所有客户端同进程）会把吞吐压低约 2.5 倍，必须分进程；插桩用的全局原子计数器、回调里的锁都会显著改变结果；本机背景负载约 1.2 核且波动，同一配置能测出 27K 和 77K。要交替跑、取中位数。
 - `go.mod` 是 `go 1.24`（被 msgp v1.6.5 抬上去的），循环变量**每轮独立**，闭包捕获循环变量不再需要 `idx := i`（`integration_test.go` 里那处显式捕获现在只是冗余，留着无害）。注意这是从 1.20 升上来的语义变化，老代码里如果有依赖"共享循环变量"的写法，行为会变。
