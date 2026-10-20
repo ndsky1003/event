@@ -1,3 +1,5 @@
+//go:generate msgp -tests=false
+
 package msgtype
 
 import "fmt"
@@ -6,7 +8,10 @@ type T uint8
 
 const (
 	Invalid T = iota
-	Ping      //心跳维护
+	// Ping / Pong 已经不再使用：心跳与断连检测下沉到了传输层（conn.go 的
+	// flag_ping / flag_pong 帧），不再走应用层消息。
+	// 枚举值保留原位是为了不改变后面几项的线上取值——删掉会让 Verify 从 3 变 1。
+	Ping
 	Pong
 	Verify
 	On         //监听事件

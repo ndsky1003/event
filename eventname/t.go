@@ -1,3 +1,5 @@
+//go:generate msgp -tests=false
+
 package eventname
 
 import "strings"

@@ -1,8 +1,11 @@
 package event
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"sync"
@@ -16,18 +19,130 @@ const (
 	flag_pong
 )
 
-var (
-	flag_msg_data  = []byte{flag_msg}
-	flag_ping_data = []byte{flag_ping}
-	flag_pong_data = []byte{flag_pong}
+const (
+	// 帧格式：[flag 1 字节][body 长度 4 字节 BigEndian][body]
+	// 帧与帧背靠背相连，一帧最多占 2 个 iovec（hdr + body），由 net.Buffers 一次 writev 发出
+	frameHeaderSize = 5
+	maxFrameSize    = 64 << 10
+	// IOV_MAX = 1024，每帧最多 2 个 iovec，所以一批最多 512 帧
+	maxBatchFrames = 512
+	sendChanSize   = 30
 )
+
+// Handler 处理收到的业务帧（flag_msg）的 body
+type Handler interface {
+	HandleMsg(body []byte) error
+}
+
+// connOption Conn 这一层的参数，与 ClientOption/ServerOption 独立
+type connOption struct {
+	HeartInterval      *time.Duration // 看门狗周期；空闲超过它才发 PING
+	ReadTimeoutFactor  *float64       // 判死时限 = HeartInterval * 该系数，默认 2.2
+	WriteTimeoutFactor *float64       // 单次 writev 的上限 = HeartInterval * 该系数，默认 2.2
+	HandshakeTimeout   *time.Duration // pump 启动前握手读写的超时
+}
+
+func ConnOptions() *connOption {
+	return new(connOption)
+}
+
+func (this *connOption) SetHeartInterval(d time.Duration) *connOption {
+	if this == nil {
+		return this
+	}
+	this.HeartInterval = &d
+	return this
+}
+
+func (this *connOption) SetReadTimeoutFactor(f float64) *connOption {
+	if this == nil {
+		return this
+	}
+	this.ReadTimeoutFactor = &f
+	return this
+}
+
+func (this *connOption) SetWriteTimeoutFactor(f float64) *connOption {
+	if this == nil {
+		return this
+	}
+	this.WriteTimeoutFactor = &f
+	return this
+}
+
+func (this *connOption) SetHandshakeTimeout(d time.Duration) *connOption {
+	if this == nil {
+		return this
+	}
+	this.HandshakeTimeout = &d
+	return this
+}
+
+func (this *connOption) merges(opts ...*connOption) *connOption {
+	for _, opt := range opts {
+		this.merge(opt)
+	}
+	return this
+}
+
+func (this *connOption) merge(opt *connOption) {
+	if opt == nil {
+		return
+	}
+	if opt.HeartInterval != nil {
+		this.HeartInterval = opt.HeartInterval
+	}
+	if opt.ReadTimeoutFactor != nil {
+		this.ReadTimeoutFactor = opt.ReadTimeoutFactor
+	}
+	if opt.WriteTimeoutFactor != nil {
+		this.WriteTimeoutFactor = opt.WriteTimeoutFactor
+	}
+	if opt.HandshakeTimeout != nil {
+		this.HandshakeTimeout = opt.HandshakeTimeout
+	}
+}
+
+// frame 一帧待发数据。hdr 内联（每帧一份，不能复用 scratch：帧会在 chan 和
+// net.Buffers 里排队，共享缓冲区会被后一帧覆盖）；body 直接引用调用方的字节，不复制。
+type frame struct {
+	hdr  [frameHeaderSize]byte
+	body []byte
+}
+
+var framePool = sync.Pool{
+	New: func() any { return new(frame) },
+}
+
+func (this *frame) Release() {
+	this.hdr = [frameHeaderSize]byte{}
+	this.body = nil
+	framePool.Put(this)
+}
 
 type Conn struct {
 	net.Conn
-	// r        io.Reader
+	r    *bufio.Reader
+	hbuf [frameHeaderSize]byte // 读侧帧头，只有 readPump 一个 goroutine 用
+
 	handler Handler
 
-	closed atomic.Bool // 原子状态标记
+	heartInterval    time.Duration
+	readTimeout      time.Duration
+	writeTimeout     time.Duration
+	handshakeTimeout time.Duration
+
+	// 只有 writePump 这一个 goroutine 从 socket 写；其他 goroutine 一律通过 sendChan 投递。
+	// sendChan 永远不 close：close 会和生产者竞态，靠 ctx + closed 收尾。
+	sendChan chan *frame
+	bufs     net.Buffers // writePump 专用，攒一批的 iovec 列表
+
+	// 看门狗状态：readPump 每帧刷 lastRead，writePump 的看门狗读它。
+	// nextDeadline 是 readPump 自己的检查点，只有 readPump 读写
+	lastRead     atomic.Int64 // UnixNano，上一次收到任何字节的时刻
+	nextDeadline time.Time
+
+	closed atomic.Bool
 	ctx    context.Context
 	cancel context.CancelFunc
 
@@ -35,163 +150,374 @@ type Conn struct {
 	closeErr error
 }
 
-func New(conn net.Conn, handler Handler) (*Conn, error) {
+func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
+	// 先铺默认值，再让调用方的 opts 覆盖（merge 只认非 nil 字段），
+	// 与 client.go / server.go 的写法保持一致；这样下面解引用不用再判 nil
+	opt := ConnOptions().
+		SetHeartInterval(10 * time.Second).
+		SetReadTimeoutFactor(2.2). // 允许丢 1 个心跳，并允许第 2 个晚到 20%
+		SetWriteTimeoutFactor(2.2).
+		SetHandshakeTimeout(5 * time.Second).
+		merges(opts...)
 
 	c := &Conn{
-		Conn:    conn,
-		handler: handler,
+		Conn:             conn,
+		r:                bufio.NewReaderSize(conn, 16<<10),
+		handler:          handler,
+		heartInterval:    *opt.HeartInterval,
+		readTimeout:      time.Duration(float64(*opt.HeartInterval) * *opt.ReadTimeoutFactor),
+		writeTimeout:     time.Duration(float64(*opt.HeartInterval) * *opt.WriteTimeoutFactor),
+		handshakeTimeout: *opt.HandshakeTimeout,
+		sendChan:         make(chan *frame, sendChanSize),
+		bufs:             make(net.Buffers, 0, maxBatchFrames*2),
 	}
 	c.closed.Store(false)
+	c.ctx, c.cancel = context.WithCancel(context.Background())
+
+	now := time.Now().UnixNano()
+	c.lastRead.Store(now)
+	c.nextDeadline = time.Now().Add(c.readTimeout)
 	return c, nil
 }
 
-func (this *Conn) write(flag byte, data []byte) (n int64, err error) {
-	var flags []byte
-	switch flag {
-	case flag_msg:
-		flags = flag_msg_data
-	case flag_ping:
-		flags = flag_ping_data
-	case flag_pong:
-		flags = flag_pong_data
-	default:
-		err = fmt.Errorf("dd")
-	}
-	v := net.Buffers{flags, data}
-	return v.WriteTo(this)
+// Close 主动关闭，幂等。要停连接请调它，不要只调 cancel——cancel 叫不醒阻塞中的 read。
+func (this *Conn) Close() error {
+	return this.CloseWithError(ErrConnClosed)
 }
 
-func (this *Conn) read(data []byte) (flag byte, size uint64, n int, err error) {
-	// flag, err = this.r.ReadByte()
-	// if err != nil {
-	// 	return
-	// }
-	// if flag == flag_ping || flag == flag_pong {
-	// 	return
-	// }
-	// size, err = binary.ReadUvarint(this.r)
-	// if err != nil {
-	// 	return
-	// }
-	// if size > 64<<10 {
-	// 	err = fmt.Errorf("frame size %d exceeds maximum %d", size, 64<<10)
-	// 	return
-	// }
-	//
-	// if size == 0 {
-	// 	err = fmt.Errorf("invalid frame size 0")
-	// 	return
-	// }
-
-	n, err = this.Read(data)
-	return
+// CloseWithError 关闭并记录原因，幂等；第一个非 nil 原因生效。
+// pump 异常退出时调它：cancel 叫醒 writePump，Conn.Close 叫醒阻塞中的 readPump。
+// 只有第一个调用者真正执行关闭并返回底层错误；后续调用是空操作，返回 nil，
+// 想知道连接为什么结束用 Err()。
+func (this *Conn) CloseWithError(err error) error {
+	if err != nil {
+		this.l.Lock()
+		if this.closeErr == nil {
+			this.closeErr = err
+		}
+		this.l.Unlock()
+	}
+	if !this.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	this.cancel()
+	return this.Conn.Close()
 }
 
-func (this *Conn) ping() (err error) {
+// Err 返回连接关闭的原因；未关闭返回 nil，主动 Close 返回 ErrConnClosed
+func (this *Conn) Err() error {
+	this.l.Lock()
+	defer this.l.Unlock()
+	return this.closeErr
+}
 
-	if err = this.write(flag_ping, []byte{}); err != nil {
-		err = fmt.Errorf("ping:%w", err)
-		return
+func (this *Conn) IsClosed() bool {
+	return this.closed.Load()
+}
+
+// Serve 启动读写泵并阻塞到两者都退出，返回连接终止的原因。
+// 主动 Close 返回 ErrConnClosed；对端断连或超时返回包装后的底层错误。
+func (this *Conn) Serve() error {
+	// 初始 read deadline：对端连上一个字节都不发，也能在 readTimeout 内被踢掉。
+	// 之后由 readPump 按检查点续期、writePump 的看门狗判死。
+	dl := time.Now().Add(this.readTimeout)
+	this.nextDeadline = dl
+	if err := this.SetReadDeadline(dl); err != nil {
+		this.CloseWithError(fmt.Errorf("set read deadline: %w", err))
 	}
 
-	if err = this.Flush(); err != nil {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		if err := this.writePump(); err != nil {
+			this.CloseWithError(err)
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := this.readPump(); err != nil {
+			this.CloseWithError(err)
+		}
+	}()
+	wg.Wait()
+
+	this.Close()
+	return this.Err()
+}
+
+// SetHandler 设置业务处理器。必须在 Serve() 之前调用。
+func (this *Conn) SetHandler(h Handler) {
+	this.handler = h
+}
+
+// writeSync 直接写一帧并落盘，绕过 sendChan。
+// 只允许在 Serve() 之前用（握手）：那时 writePump 还没起，不存在并发写，
+// 也就不会和 this.bufs / sendChan 抢。
+func (this *Conn) writeSync(flag byte, data []byte) error {
+	f, err := newFrame(flag, data)
+	if err != nil {
 		return err
 	}
+	defer f.Release()
 
-	return
-}
-
-func (this *Conn) pong() error {
-	msg := msgPool.Get().(*msg)
-	msg.flag = flag_pong
-	select {
-	case this.sendChan <- msg:
-	default:
-		msg.Release()
-		// 如果发送缓冲区满，丢弃 PONG 是安全的，对方会在下一个周期重试 PING
-		// 或者对方发送业务数据时也会刷新活跃状态
-		slog.Warn("pong", "err", "send pong buffer full") //pong 失败不应该关闭链接
-		return nil
+	if err = this.SetWriteDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	bufs := net.Buffers{f.hdr[:]}
+	if len(f.body) > 0 {
+		bufs = append(bufs, f.body)
+	}
+	if _, err = bufs.WriteTo(this.Conn); err != nil {
+		return fmt.Errorf("write frame: %w", err)
 	}
 	return nil
 }
 
-// writePump 负责将 sendChan 中的数据写入连接，并维护心跳
-// 采用“智能心跳”策略：仅在连接空闲时发送 PING
-func (this *Conn) writePump() (err error) {
-	heartInterval := *this.opt.HeartInterval
-	// 发送检测周期设为心跳间隔的一半，确保有足够的冗余
-	// keepAliveDuration := heartInterval / 2
+// readSync 直接读一帧。同样只允许在 Serve() 之前调用。
+func (this *Conn) readSync() (flag byte, body []byte, err error) {
+	if err = this.SetReadDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+		return 0, nil, fmt.Errorf("set read deadline: %w", err)
+	}
+	return this.read()
+}
 
-	// 使用 Timer 实现弹性心跳
-	timer := time.NewTimer(heartInterval)
-	defer timer.Stop()
+// newFrame 组帧：填 flag + 4 字节长度，body 只引用不复制
+func newFrame(flag byte, data []byte) (*frame, error) {
+	if len(data) > maxFrameSize {
+		return nil, fmt.Errorf("frame size %d exceeds maximum %d", len(data), maxFrameSize)
+	}
+	f := framePool.Get().(*frame)
+	f.hdr[0] = flag
+	binary.BigEndian.PutUint32(f.hdr[1:], uint32(len(data)))
+	f.body = data
+	return f, nil
+}
 
-	for {
-		select {
-		case <-this.ctx.Done():
-			return nil
-		case msg, ok := <-this.sendChan:
-			if !ok {
-				return fmt.Errorf("sendChan closed")
-			}
+// closedErr 返回连接关闭的原因，保证非 nil。
+// write 这类路径一定要拿到真错误：返回 nil 会让上层以为"已经发出去了"，
+// 而帧其实没进发送队列，属于静默丢数据。
+func (this *Conn) closedErr() error {
+	if err := this.Err(); err != nil {
+		return err
+	}
+	return ErrConnClosed
+}
 
-			// 发送数据（业务消息或 PONG）
-			if err = this.writes(msg.flag, msg.data, msg.opt); err != nil {
-				msg.Release()
-				return err
-			}
-			msg.Release()
-			// 2. 【关键策略】：检查通道里是否还有排队的数据？
-			// 如果还有，就继续循环去拿，暂不 Flush，为了拼成大包。
-			// 如果没有了，说明这波突发流量结束了，立刻 Flush 保证低延迟。
-			if len(this.sendChan) > 0 {
-				continue
-			}
-
-			if err = this.w.Flush(); err != nil {
-				return
-			}
-
-			// 发送成功，连接处于活跃状态，重置 PING 定时器
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			timer.Reset(heartInterval)
-
-		case <-timer.C:
-			// 定时器触发，说明 keepAliveDuration 时间内未发送任何数据
-			// 发送 PING 维持连接活跃
-			if err = this.ping(); err != nil {
-				return err
-			}
-			// 发送 PING 后重置定时器
-			timer.Reset(heartInterval)
+// write 组帧并投递到 sendChan，供外部 goroutine（Emit 等）调用。
+// 通道满时阻塞，直到写出去、ctx 结束或连接关闭。
+// 注意：返回只代表"已入队"，data 的所有权要等 writev 完成才真正交出去，
+// 调用方在此之前不能复用/归还 data。
+func (this *Conn) write(flag byte, data []byte) error {
+	if this.closed.Load() {
+		return this.closedErr()
+	}
+	f, err := newFrame(flag, data)
+	if err != nil {
+		return err
+	}
+	select {
+	case this.sendChan <- f:
+		// 入队和 Close 之间没有原子性：可能刚 check 完 closed=false，
+		// 另一边就 CAS 成功并 cancel 了，select 两个 case 同时就绪时是随机选，
+		// 于是帧进了一个已经没有消费者的队列。这里补一次检查，
+		// 把"静默丢一条"变成"如实报错"。
+		if this.closed.Load() {
+			return this.closedErr()
 		}
+		return nil
+	case <-this.ctx.Done():
+		f.Release()
+		return this.closedErr()
 	}
 }
 
-// readPump 负责从连接读取数据，并作为“看门狗”检测连接超时
-func (this *Conn) readPump() error {
-	// heartInterval := *this.opt.HeartInterval
-	// 【修改点】优化超时策略
-	// 发送间隔是  heartInterval。
-	// 将超时设为 2.2 * heartInterval (或者 heartInterval + 2*time.Second)。
-	// 意义：允许丢失 1 个心跳包 (1)，并允许第 2 个心跳包 (2) 晚到 20% 的时间。
-	// 这比 2.0 倍敏感得多，能更快发现断连，同时防止轻微抖动导致的误断。
-	// readTimeout := time.Duration(float64(heartInterval) * *this.opt.ReadTimeoutFactor)
+// tryWrite 非阻塞投递。通道满就返回 false，由调用方决定丢弃还是报错。
+// pong 和 writePump 的心跳必须走这里：它们本身就在 writePump/readPump 里，
+// 用阻塞的 write 会自己等自己，直接死锁。
+func (this *Conn) tryWrite(flag byte, data []byte) bool {
+	if this.closed.Load() {
+		return false
+	}
+	f, err := newFrame(flag, data)
+	if err != nil {
+		return false
+	}
+	select {
+	case this.sendChan <- f:
+		return true
+	default:
+		f.Release()
+		return false
+	}
+}
+
+// writeBatch 把一批帧拼成 net.Buffers，一次 writev 发出。
+// 只能由 writePump 调用（this.bufs 无锁）。
+func (this *Conn) writeBatch(frames []*frame) error {
+	if len(frames) == 0 {
+		return nil
+	}
+	this.bufs = this.bufs[:0]
+	for _, f := range frames {
+		this.bufs = append(this.bufs, f.hdr[:])
+		if len(f.body) > 0 {
+			this.bufs = append(this.bufs, f.body)
+		}
+	}
+
+	// 写 deadline 是兜底：对端已死时 writev 会卡在 TCP 重传里，
+	// 没有它 writePump 能挂几分钟，readPump 也一起挂死。
+	if err := this.SetWriteDeadline(time.Now().Add(this.writeTimeout)); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+
+	// 必须传 this.Conn，不能传 this：
+	// *net.TCPConn 实现了 buffersWriter 才会走 writev，*Conn 没实现会退化成逐个 Write。
+	// 另外 WriteTo 会消费它拿到的那个 slice header，所以转一个临时值出去，保住 this.bufs。
+	bufs := net.Buffers(this.bufs)
+	if _, err := bufs.WriteTo(this.Conn); err != nil {
+		// writev 部分写后出错，字节流已经错位，这条连接只能关掉
+		return fmt.Errorf("writev %d frames: %w", len(frames), err)
+	}
+	return nil
+}
+
+// read 读一帧。固定 5 字节头，一次 ReadFull 就能拿到，不用 varint 逐字节读。
+func (this *Conn) read() (flag byte, body []byte, err error) {
+	if _, err = io.ReadFull(this.r, this.hbuf[:]); err != nil {
+		return
+	}
+	flag = this.hbuf[0]
+	size := binary.BigEndian.Uint32(this.hbuf[1:])
+	if size > maxFrameSize {
+		err = fmt.Errorf("frame size %d exceeds maximum %d", size, maxFrameSize)
+		return
+	}
+	if size == 0 {
+		// PING / PONG 帧只有 5 字节头
+		return
+	}
+	body = make([]byte, size) // 想省分配就从 sync.Pool 取，需约定 handler 用完归还
+	_, err = io.ReadFull(this.r, body)
+	return
+}
+
+// ping 由 writePump 的 pingTimer 调用（只有空闲时才会触发），非阻塞投递
+func (this *Conn) ping() {
+	if !this.tryWrite(flag_ping, nil) {
+		// 通道里还排着数据，说明连接本来就活跃，这个周期跳过 PING 是安全的
+		slog.Warn("ping", "err", "send buffer full, skip ping")
+	}
+}
+
+// pong 由 readPump 调用。丢弃 PONG 是安全的：对方下个周期会重试 PING，
+// 或者对方发业务数据时也会刷新活跃状态，所以不应该因此关连接。
+func (this *Conn) pong() {
+	if !this.tryWrite(flag_pong, nil) {
+		slog.Warn("pong", "err", "send pong buffer full")
+	}
+}
+
+// checkAlive 看门狗：对端在 readTimeout 内没发过任何字节（含 PONG）就判定断连。
+// readPump 自己的 read deadline 也会到期，这里只是先一步给出明确原因。
+func (this *Conn) checkAlive() error {
+	if d := time.Since(time.Unix(0, this.lastRead.Load())); d > this.readTimeout {
+		return fmt.Errorf("peer silent for %v (limit %v)", d, this.readTimeout)
+	}
+	return nil
+}
+
+// writePump 负责将 sendChan 中的数据写入连接，并维护看门狗与心跳。
+// 两个定时器分工明确，不能合成一个：
+//   - watch 固定周期、从不 Reset，再忙也会触发，负责判死
+//   - pingTimer 每次成功写出后重置，只有真正空闲才发 PING。它是相对计时，
+//     不受 ticker 抖动影响——用"now-lastWrite >= heartInterval"这种时长比较，
+//     实测会因为 149.9998ms 这种抖动少 0.2 微秒而跳过 PING，把活连接判死。
+func (this *Conn) writePump() (err error) {
+	watch := time.NewTicker(this.heartInterval)
+	defer watch.Stop()
+	pingTimer := time.NewTimer(this.heartInterval)
+	defer pingTimer.Stop()
+
+	batch := make([]*frame, 0, maxBatchFrames)
+	defer func() {
+		for _, f := range batch {
+			f.Release()
+		}
+	}()
+
 	for {
-		// 每次读取前设置 DeadLine，给连接“续命”
-		flag, body, err := this.read()
-		if err != nil {
-			// 如果超时，这里会返回 i/o timeout 错误
-			return fmt.Errorf("read error: %w", err)
+		var f *frame
+		select {
+		case <-this.ctx.Done():
+			return nil
+		case f = <-this.sendChan:
+		case <-watch.C:
+			if err = this.checkAlive(); err != nil {
+				return err
+			}
+			continue
+		case <-pingTimer.C:
+			// ping 走 tryWrite：writePump 自己是 sendChan 唯一的消费者，
+			// 用阻塞的 write 会自己等自己。通道满就跳过这个周期。
+			this.ping()
+			pingTimer.Reset(this.heartInterval)
+			continue
 		}
 
-		// 收到任何数据，说明连接是健康的。下一次循环会重新设置 ReadDeadline。
+		// 拿到一帧后非阻塞排空，攒成一批；通道空了就立刻发，低负载下不会为了攒包憋延迟
+		batch = append(batch, f)
+	drain:
+		for len(batch) < maxBatchFrames {
+			select {
+			case f = <-this.sendChan:
+				batch = append(batch, f)
+			default:
+				break drain
+			}
+		}
+
+		if err = this.writeBatch(batch); err != nil {
+			return err
+		}
+		for _, x := range batch {
+			x.Release()
+		}
+		batch = batch[:0]
+
+		// 刚写过数据，连接活跃，把 PING 推后一个周期
+		if !pingTimer.Stop() {
+			select {
+			case <-pingTimer.C:
+			default:
+			}
+		}
+		pingTimer.Reset(this.heartInterval)
+	}
+}
+
+// readPump 负责从连接读取数据。
+// deadline 不在每帧刷新：那在热路径上是白扔的开销（拿 fd 锁 + 起停 timer）。
+// 改成只在预算快用尽时续期，调用次数从"每帧一次"降到"每个 heartInterval 一次"。
+func (this *Conn) readPump() error {
+	for {
+		now := time.Now()
+		// 收到任何数据都说明连接健康，先记账，writePump 的看门狗读这个值
+		this.lastRead.Store(now.UnixNano())
+
+		if now.After(this.nextDeadline.Add(-this.heartInterval)) {
+			this.nextDeadline = now.Add(this.readTimeout)
+			if err := this.SetReadDeadline(this.nextDeadline); err != nil {
+				return fmt.Errorf("set read deadline: %w", err)
+			}
+		}
+
+		flag, body, err := this.read()
+		if err != nil {
+			// 超时在这里以 i/o timeout 出现；对端断连以 EOF / reset 出现
+			return fmt.Errorf("read error: %w", err)
+		}
 
 		switch flag {
 		case flag_msg:
@@ -211,8 +537,7 @@ func (this *Conn) readPump() error {
 			// 收到 PING，回复 PONG
 			this.pong()
 		case flag_pong:
-			// 收到 PONG，仅表示对方活着，ReadDeadline 已自动刷新，无需操作
-			// log.Println("receive pong")
+			// 收到 PONG，仅表示对方活着，lastRead 已刷新，无需操作
 		default:
 			return fmt.Errorf("unknown flag: %d", flag)
 		}

@@ -1,3 +1,5 @@
+//go:generate msgp -tests=false
+
 package coder
 
 import (

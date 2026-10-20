@@ -69,23 +69,29 @@ func (this *Client) On(t eventname.T, Func any) {
 	this.rwl.Lock()
 	var isExist bool
 	var methods []*method
-	var topic *topic.Topic
+	var existTP *topic.Topic
 	for tp, ev := range this.topics {
 		if tp.Equal(t) {
 			methods = append(ev, mType)
-			topic = tp
+			existTP = tp
 			isExist = true
 			break
 		}
 	}
 	if isExist {
-		this.topics[topic] = methods
+		this.topics[existTP] = methods
 	} else {
 		methods = []*method{mType}
 		this.topics[newtp] = methods
 	}
 	this.rwl.Unlock()
 	if !isExist {
-		go this.regist_topic()
+		// 同步注册。用 go 的话，On 之后紧跟的 Emit 可能先到达服务端——
+		// 那时 topic 还没注册，事件直接变成"无人监听"被丢掉，而且不报错。
+		// 服务端现在也是同步处理单条连接的消息（service.HandleMsg），
+		// 两端一起才真正保证顺序。
+		// 连接还没起来时 regist_topic 会立刻返回，connect 成功后再补注册，
+		// 所以这里不会阻塞在"没连接"上。
+		this.regist_topic()
 	}
 }

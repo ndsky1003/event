@@ -1,11 +1,11 @@
 module github.com/ndsky1003/event/v2
 
-go 1.20
+go 1.24
 
 require (
 	github.com/antlabs/timer v0.1.4
 	github.com/sirupsen/logrus v1.9.0
-	github.com/tinylib/msgp v1.2.5
+	github.com/tinylib/msgp v1.6.5
 	github.com/vmihailenco/msgpack/v5 v5.4.1
 )
 

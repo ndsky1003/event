@@ -9,8 +9,8 @@ import (
 type ClientOption struct {
 	name           *string
 	secret         *string
-	check_interval *time.Duration //链接检测,不能说断链了就马上去连,这会造成不必要的资源消耗
-	heart_interval *time.Duration //心跳检测的间隔
+	check_interval *time.Duration //链接检测,不能说断链了就马上去连,这会造成不必要的资源消耗。单位就是 time.Duration 本身,不要再乘 time.Second
+	heart_interval *time.Duration //心跳检测的间隔。单位就是 time.Duration 本身
 	is_wrap_error  *bool
 	coder_type     *coder.T //事件参数的编码方式,默认为 Msgp
 }
@@ -35,6 +35,7 @@ func (this *ClientOption) SetSecret(secret string) *ClientOption {
 	return this
 }
 
+// SetCheckInterval 断线重连的检测间隔。t 是完整的 time.Duration，例如 2*time.Second，不是秒数。
 func (this *ClientOption) SetCheckInterval(t time.Duration) *ClientOption {
 	if this == nil {
 		return this
@@ -42,6 +43,8 @@ func (this *ClientOption) SetCheckInterval(t time.Duration) *ClientOption {
 	this.check_interval = &t
 	return this
 }
+
+// SetHeartInterval 心跳间隔。t 是完整的 time.Duration，例如 20*time.Second，不是秒数。
 func (this *ClientOption) SetHeartInterval(t time.Duration) *ClientOption {
 	if this == nil {
 		return this
@@ -104,9 +107,10 @@ func (this *ClientOption) merge(opt *ClientOption) {
 }
 
 type ServerOption struct {
-	Timeout       *time.Duration
-	secret        *string
-	is_wrap_error *bool //默认情况下会包装,这个错误来自哪
+	Timeout        *time.Duration //等待所有监听者响应的超时。单位就是 time.Duration 本身,不要再乘 time.Second
+	heart_interval *time.Duration //传输层心跳间隔。单位就是 time.Duration 本身
+	secret         *string
+	is_wrap_error  *bool //默认情况下会包装,这个错误来自哪
 }
 
 func ServerOptions() *ServerOption {
@@ -127,6 +131,9 @@ func (this *ServerOption) merge(opt *ServerOption) {
 	if opt.Timeout != nil {
 		this.Timeout = opt.Timeout
 	}
+	if opt.heart_interval != nil {
+		this.heart_interval = opt.heart_interval
+	}
 	if opt.secret != nil {
 		this.secret = opt.secret
 	}
@@ -135,11 +142,21 @@ func (this *ServerOption) merge(opt *ServerOption) {
 	}
 }
 
+// SetTimeout 等待所有监听者响应的超时。t 是完整的 time.Duration，例如 10*time.Second，不是秒数。
 func (this *ServerOption) SetTimeout(t time.Duration) *ServerOption {
 	if this == nil {
 		return this
 	}
 	this.Timeout = &t
+	return this
+}
+
+// SetHeartInterval 传输层心跳间隔。t 是完整的 time.Duration，例如 20*time.Second，不是秒数。
+func (this *ServerOption) SetHeartInterval(t time.Duration) *ServerOption {
+	if this == nil {
+		return this
+	}
+	this.heart_interval = &t
 	return this
 }
 

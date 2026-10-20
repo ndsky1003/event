@@ -13,8 +13,9 @@ func TestMain(m *testing.M) {
 	go NewServer().Listen("127.0.0.1:8080")
 	time.Sleep(1e8)
 	c := Dial("127.0.0.1:8080")
-	c.On("ppxia", func(name string) {
+	c.On("ppxia", func(name string) error {
 		fmt.Println("receive:", name)
+		return nil
 	})
 	time.Sleep(1e8)
 

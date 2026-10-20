@@ -1,6 +1,6 @@
 # event
 
-基于观察者模式的事件总线库：通过 TCP 在多个进程间做事件订阅/发布（消息框架用 gob 编码、事件参数用 msgpack 编码），典型场景是"多服务器配置文件检查"。
+基于观察者模式的事件总线库：通过 TCP 在多个进程间做事件订阅/发布（消息框架与事件参数都走 msgpack 编码，默认 `coder.Msgp`），典型场景是"多服务器配置文件检查"。
 
 ## 安装
 
@@ -57,8 +57,10 @@ if err := client.Emit("db_op", 1, "hello", &Person{Name: "飞毛腿1号", Age: 1
 ### 服务端
 
 - `event.NewServer(opts ...*ServerOption)` — 创建服务端（`server` 类型未导出）。
-- `Listen(url string)` — 监听单个地址，如 `":8080"`。
-- `Listens(addrs []string)` — 监听多个地址。
+- `Listen(url string)` — 监听单个地址，如 `":8080"`。**阻塞**，直到 `Shutdown`。
+- `Listens(addrs []string)` — 监听多个地址（最后一个地址阻塞，其余各起一个 goroutine）。
+- `Shutdown() error` — 关闭服务端：停止监听 → 断开所有客户端连接 → 停掉时间轮，并等已接进来的连接处理干净。**幂等**；会让阻塞在 `Listen`/`Listens` 里的调用返回。不调它的话 accept 循环与时间轮 goroutine 没有退出的一天。
+- `IsShutdown() bool` — 是否已关闭。
 
 服务端选项 `event.ServerOptions()`：
 
@@ -68,14 +70,32 @@ if err := client.Emit("db_op", 1, "hello", &Person{Name: "飞毛腿1号", Age: 1
 | `SetSecret(string)` | 连接握手密钥，客户端需一致 | 空 |
 | `SetIsWrapError(bool)` | 是否包装错误来源 | `true` |
 
+### 关闭服务端
+
+`Listen` / `Listens` 是阻塞的，`Shutdown` 要从另一个 goroutine 调，用它来返回：
+
+```go
+srv := event.NewServer()
+go srv.Listen(":8080")
+
+// ... 收到退出信号时
+if err := srv.Shutdown(); err != nil {
+    // handle error
+}
+```
+
+`Shutdown` 关掉监听、断开所有客户端连接、停掉时间轮，并等已接进来的连接处理干净（幂等）。客户端会感知到断连，本地未完成的 `Call` 被结算成错误；客户端自己也要调 `Close()` 才会停止重连。
+
 ### 客户端
 
-- `event.Dial(url string, opts ...*ClientOption) *Client` — 创建客户端，内置自动重连与心跳。
-- `On(t eventname.T, Func any)` — 注册监听（无返回值）。
+- `event.Dial(url string, opts ...*ClientOption) *Client` — 创建客户端，内置自动重连与心跳。`Dial` 是异步的，返回时连接可能还没建立。
+- `On(t eventname.T, Func any)` — 注册监听（无返回值）。连接已就绪时**同步**完成注册，所以 `On` 之后可以立刻 `Emit`。
 - `Emit(en eventname.T, args ...any) error` — 发布，等所有监听者返回。
 - `EmitAsync(en eventname.T, args ...any) *Call` — 异步发布。
 - `EmitSomeOne(en eventname.T, args ...any) error` — 发布，只等最快的响应。
 - `EmitSomeOneAsnyc(en eventname.T, args ...any) *Call` — 异步版。
+- `Stop(err error)` — 断开当前连接，**会自动重连**；`err` 会被结算到所有未完成的 `Call` 上。
+- `Close() error` — 彻底关闭：断开当前连接并停止重连，幂等。不用 `Close` 的话，客户端的重连 goroutine 与连接会一直存在。
 
 客户端选项 `event.ClientOptions()`：
 
@@ -126,5 +146,8 @@ if err := call.Err; err != nil {
 - 可选 msgp 快路径：对参数类型跑 `msgp` 生成 `*_gen.go` 后，**值类型参数**（`func(o Outer) error`）自动走 msgp（无反射，更快）；**指针类型参数**（`func(o *Outer) error`）仍走 msgpack（为支持 `nil`）。两者 struct 默认都编码成 map 格式，互通。
 - 整数解码**不校验溢出**：`Emit` 传的整数与回调入参位宽不一致会静默截断（如 `int64(300)` 解成 `int8` 得 `44`，不报错），请保证 `Emit` 传参与回调签名类型严格一致。
 - `Emit` 传 `nil` 指针会正确还原为 `nil`。
-- 单个事件的参数个数受 `Msg.BodyCount`（`int8`）限制，最多 127 个。
+- 单个事件的参数个数受 `Msg.BodyCount`（`int8`）限制，最多 127 个；超过会直接返回 `too many args` 错误，不会静默丢参数。
+- **顺序**：同一条连接上的消息按到达顺序处理，所以 `On` 之后立刻 `Emit` 不会丢事件。但**跨连接之间没有顺序保证**——发布者与监听者是两条连接时，先发的 `On` 注册帧与后发的 `Emit` 之间仍有一个网络往返的窗口，稳妥做法是等注册完成（`On` 在连接已就绪时是同步的）或重试。
+- **投递语义是 at-most-once**：`Emit` 返回 `nil` 只代表所有监听者都回了包。监听者收下请求后断线，发布者会拿到 `connection lost before response` 错误，但事件是否已被处理无法确定，库不会自动重投。
+- 监听者断线时，它欠着的请求会被**立即**结算（错误里带 `connection lost before response`），不会让发布者干等 `SetTimeout`。
 - 导入本库会触发 `logrus.SetReportCaller(true)`（`client.go` 的 `init()`），有全局副作用。
