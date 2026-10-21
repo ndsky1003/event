@@ -12,7 +12,7 @@ go vet ./...
 - 模块路径是 `github.com/ndsky1003/event/v2`（带 `/v2`，import 时必须带上）。
 - 当前工作分支是 `v2`；仓库另有 `main`、`v3` 分支，注意别改错分支。
 - `go test ./...` 的 `client_test.go` 里 `TestMain` 会真实监听 `127.0.0.1:8080`，端口被占用会 panic，跑测试前先确认端口空闲。
-- 现在有真测试了：`integration_test.go`（端到端：收发/错误回传/正则 topic/心跳/重连/secret/多监听者聚合）、`envelope_test.go`（消息框架编解码 + benchmark）、`coder/`、`codec` 已无测试。`client_test.go` 里只剩 `TestMain` 和 `BenchmarkEmit`。
+- 现在有真测试了：`integration_test.go`（端到端：收发/错误回传/正则 topic/心跳/重连/secret/多监听者聚合/断线结算等）、`envelope_test.go`（消息框架编解码 + benchmark）、`conn_test.go`（连接层：写后关闭/超长帧）、`coder/`（各 coder 往返 + benchmark）。`client_test.go` 里只剩 `TestMain` 和 `BenchmarkEmit`。
 - 快速验证：`go build ./... && go vet ./... && go test -race ./...`。
 
 ## 架构
@@ -20,7 +20,7 @@ go vet ./...
 - `server.go`：服务端，`NewServer()`（`server` 类型未导出），`Listen`/`Listens` 监听（**阻塞**），`Shutdown()` 关闭（幂等，`closed` 用 CAS）。topic 索引拆成 `exact map[eventname.T]*topicSids`（普通 topic 查表命中）和 `regs`（正则只能线性扫），**不要在锁内遍历全部 topic**——旧写法实测 10000 个 topic 时 QPS 掉到 3060，查表写法 5467。`this.l` 保护 `exact`/`regs`/`services`/`pending`/`service.tps`/`listeners`。
 - 服务端生命周期：listener 必须登记进 `server.listeners`，否则关不掉，`listen()` 里的 Accept 错误分支就成了永久忙循环。`acceptWg` / `connWg` 要**分开**：`Shutdown` 的顺序是"关 listener → 等 accept 循环退出 → 断连接 → 等 handle_conn 退出 → `tm.Stop()`"，合成一个 WaitGroup 就是自己等自己（连接没断，handle_conn 不会返回）。
 - `client.go`：客户端 `Dial(url, opts...)`，内含自动重连（`keepAlive`）、注册 topic（`regist_topic`）。`Stop(err)` 只断当前连接、会自动重连；**`Close()` 才是终态**（置 `stopped`、让 `keepAlive` 退出、幂等），不用 `Close` 就会漏 goroutine 和连接。
-- `conn.go`：传输层核心。`Conn` 内嵌 `net.Conn`，帧格式 `[flag 1B][body 长度 4B BigEndian][body]`；`flag_msg`/`flag_ping`/`flag_pong`。只有 `writePump` 一个 goroutine 写 socket，别人通过 `sendChan`（容量 30）投递，`writePump` 攒批后用 `net.Buffers` 一次 writev 发出。心跳与断连检测在这一层（`heartInterval` ticker 看门狗 + `pingTimer` 空闲才 PING，判死时限 `2.2 * heartInterval`）。`Serve()` 起两个泵并阻塞到连接结束；`Close()` 幂等，`cancel` 叫醒 writePump、`Conn.Close` 叫醒 readPump。`writeSync`/`readSync` 只允许在 `Serve()` 之前用（握手）。
+- `conn.go`：传输层核心。`Conn` 内嵌 `net.Conn`，帧格式 `[flag 1B][body 长度 4B BigEndian][body]`，单帧 body 上限 `maxFrameSize` 64KB；`flag_msg`/`flag_ping`/`flag_pong`。只有 `writePump` 一个 goroutine 写 socket，别人通过 `sendChan`（容量 30）投递，`writePump` 攒批后用 `net.Buffers` 一次 writev 发出。心跳与断连检测在这一层（`heartInterval` ticker 看门狗 + `pingTimer` 空闲才 PING，判死时限 `2.2 * heartInterval`）。`Serve()` 起两个泵并阻塞到连接结束；`Close()` 幂等，`cancel` 叫醒 writePump、`Conn.Close` 叫醒 readPump。`writeSync`/`readSync` 只允许在 `Serve()` 之前用（握手）。
 - `api.go`：对外 `On` / `Emit` / `EmitAsync` / `EmitSomeOne` / `EmitSomeOneAsnyc`。
 - `service.go`：服务端每条连接的封装，只做消息框架的编解码与分发；原来的 `sendChan`（容量 30）和 `codec` 字段已删，发送队列在 `Conn` 里。另外记一笔 `tps`（这条连接注册过哪些 topic，断线时只摘这几条），由 `server.l` 保护。
 - 断线收尾：`server_call.targets` 记下这次请求投递给了谁；连接死掉时 `closeLocked` **扫全部 pending** 找出它欠的响应并立即结算。别改成"每条连接维护一个 inflight 表"——那是 per-request 的 map 写，实测吃掉约 7% 吞吐，而断线是罕见路径。
@@ -40,7 +40,7 @@ go vet ./...
 - 客户端 `seq` 单调递增、**不要归零**：归零后旧连接迟到的 `Res(seq=N)` 可能结算到新连接的 call 上。
 - 正则 topic 写法是 `/db_[a-z]+/`（前后带 `/`，见 `eventname.IsReg`）。注册正则 topic 时，回调的**第一个参数必须是 `[]string`**（对应 `regexp.FindStringSubmatch` 的结果）。
 - 回调的入参类型必须与 `Emit` 传入的参数一一对应（msgpack 解码按 `method.argsType` 已存类型解，类型不匹配会报错；参数不够会补零值）。具体类型无需注册；**`interface{}` 参数会丢失具体类型**（整数可能解成 `int8`/`int64`），别用接口参数。
-- msgp 快路径（可选，针对**业务方参数类型**）：跑 `msgp` 生成 `*_gen.go` 后，**值类型参数**（`func(o Outer)`）走 msgp（`MarshalMsg`/`UnmarshalMsg`，基于 []byte）；**指针类型参数**（`func(o *Outer)`）因解码目标是 `**T`（为还原 nil），仍走 msgpack 兜底。两者 struct 默认都是 map 格式，互通。注意：msgp 的 `Decodable`（`DecodeMsg`）内部走 fwd.Reader 缓冲、连续解码会预读丢字节，所以 `coder/coder.go` 里只用 `UnmarshalMsg`。
+- msgp 快路径（可选，针对**业务方参数类型**）：跑 `msgp` 生成 `*_gen.go` 后，**值类型参数**（`func(o Outer)`）走 msgp（`MarshalMsg`/`UnmarshalMsg`，基于 []byte）；**指针类型参数**（`func(o *Outer)`）因解码目标是 `**T`（为还原 nil），仍走 msgpack 兜底。两者 struct 默认都是 map 格式，互通。注意：msgp 的 `Decodable`（`DecodeMsg`）内部走 fwd.Reader 缓冲、连续解码会预读丢字节，所以 `coder/msgpack_coder.go` 里只用 `UnmarshalMsg`。
 - msgpack 整数解码**不校验溢出**：`Emit` 传的整数与回调入参位宽不一致会静默截断（如 `int64(300)` 解成 `int8` 得 `44`，不报错），务必保证类型严格一致。
 - `Emit`（`msgtype.Req`）等所有监听者都返回才完成；`EmitSomeOne` 只等最快的响应。`EmitAsync` 返回 `*Call`（`call.Err` / `<-call.Done`）。
 - 服务端 `req` 投递失败会**立即**释放 pending（`dispatch_failed` 复用 `res` 的计数与聚合），发布者不会干等 `Timeout`（默认 10s）。但监听者**收包之后**才死/卡死，仍然只能等 Timeout——服务端不替它回包，避免"事件可能已被业务处理"时的重复消费语义。

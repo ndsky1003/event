@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -137,10 +138,8 @@ type Conn struct {
 	sendChan chan *frame
 	bufs     net.Buffers // writePump 专用，攒一批的 iovec 列表
 
-	// 看门狗状态：readPump 每帧刷 lastRead，writePump 的看门狗读它。
 	// nextDeadline / nextWriteDeadline 分别是 readPump、writePump 自己的检查点，
 	// 各自只有一个 goroutine 碰，不需要原子。
-	lastRead          atomic.Int64 // UnixNano，上一次收到任何字节的时刻
 	nextDeadline      time.Time
 	nextWriteDeadline time.Time
 
@@ -176,8 +175,6 @@ func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 	c.closed.Store(false)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
-	now := time.Now().UnixNano()
-	c.lastRead.Store(now)
 	c.nextDeadline = time.Now().Add(c.readTimeout)
 	return c, nil
 }
@@ -431,24 +428,12 @@ func (this *Conn) pong() {
 	}
 }
 
-// checkAlive 看门狗：对端在 readTimeout 内没发过任何字节（含 PONG）就判定断连。
-// readPump 自己的 read deadline 也会到期，这里只是先一步给出明确原因。
-func (this *Conn) checkAlive() error {
-	if d := time.Since(time.Unix(0, this.lastRead.Load())); d > this.readTimeout {
-		return fmt.Errorf("peer silent for %v (limit %v)", d, this.readTimeout)
-	}
-	return nil
-}
-
-// writePump 负责将 sendChan 中的数据写入连接，并维护看门狗与心跳。
-// 两个定时器分工明确，不能合成一个：
-//   - watch 固定周期、从不 Reset，再忙也会触发，负责判死
-//   - pingTimer 每次成功写出后重置，只有真正空闲才发 PING。它是相对计时，
-//     不受 ticker 抖动影响——用"now-lastWrite >= heartInterval"这种时长比较，
-//     实测会因为 149.9998ms 这种抖动少 0.2 微秒而跳过 PING，把活连接判死。
+// writePump 负责将 sendChan 中的数据写入连接，并维护心跳。
+// 判死不在这里做：readPump 的 read deadline 是唯一判死手段（对端静默时 read 超时）。
+// pingTimer 每次成功写出后重置，只有真正空闲才发 PING。它是相对计时，
+// 不受 ticker 抖动影响——用"now-lastWrite >= heartInterval"这种时长比较，
+// 实测会因为 149.9998ms 这种抖动少 0.2 微秒而跳过 PING，把活连接判死。
 func (this *Conn) writePump() (err error) {
-	watch := time.NewTicker(this.heartInterval)
-	defer watch.Stop()
 	pingTimer := time.NewTimer(this.heartInterval)
 	defer pingTimer.Stop()
 
@@ -465,11 +450,6 @@ func (this *Conn) writePump() (err error) {
 		case <-this.ctx.Done():
 			return nil
 		case f = <-this.sendChan:
-		case <-watch.C:
-			if err = this.checkAlive(); err != nil {
-				return err
-			}
-			continue
 		case <-pingTimer.C:
 			// ping 走 tryWrite：writePump 自己是 sendChan 唯一的消费者，
 			// 用阻塞的 write 会自己等自己。通道满就跳过这个周期。
@@ -515,8 +495,6 @@ func (this *Conn) writePump() (err error) {
 func (this *Conn) readPump() error {
 	for {
 		now := time.Now()
-		// 收到任何数据都说明连接健康，先记账，writePump 的看门狗读这个值
-		this.lastRead.Store(now.UnixNano())
 
 		if now.After(this.nextDeadline.Add(-this.heartInterval)) {
 			this.nextDeadline = now.Add(this.readTimeout)
@@ -527,7 +505,11 @@ func (this *Conn) readPump() error {
 
 		flag, body, err := this.read()
 		if err != nil {
-			// 超时在这里以 i/o timeout 出现；对端断连以 EOF / reset 出现
+			// 对端静默超时（read deadline 到期）单独包装成"判死"文案，
+			// 便于与对端正常断开（EOF）/ 异常断开（reset）区分；底层错误用 %w 保留。
+			if os.IsTimeout(err) {
+				return fmt.Errorf("peer silent: %w", err)
+			}
 			return fmt.Errorf("read error: %w", err)
 		}
 
@@ -549,7 +531,7 @@ func (this *Conn) readPump() error {
 			// 收到 PING，回复 PONG
 			this.pong()
 		case flag_pong:
-			// 收到 PONG，仅表示对方活着，lastRead 已刷新，无需操作
+			// 收到 PONG，仅表示对方活着，无需操作
 		default:
 			return fmt.Errorf("unknown flag: %d", flag)
 		}
