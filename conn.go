@@ -29,6 +29,7 @@ const (
 	// IOV_MAX = 1024，每帧最多 2 个 iovec，所以一批最多 512 帧
 	maxBatchFrames = 512
 	sendChanSize   = 30
+	msgChanSize    = 256
 )
 
 // Handler 处理收到的业务帧（flag_msg）的 body
@@ -151,6 +152,10 @@ type Conn struct {
 	sendChan chan *frame
 	bufs     net.Buffers // writePump 专用，攒一批的 iovec 列表
 
+	// 收侧按序队列：readPump 只负责入队，由唯一的 msgWorker 顺序调用 Handler。
+	// 这样单条连接的消息仍然严格按序，同时慢 Handler 不会阻塞读泵和心跳。
+	msgChan chan []byte
+
 	// nextDeadline / nextWriteDeadline 分别是 readPump、writePump 自己的检查点，
 	// 各自只有一个 goroutine 碰，不需要原子。
 	nextDeadline      time.Time
@@ -167,12 +172,18 @@ type Conn struct {
 func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 	// 先铺默认值，再让调用方的 opts 覆盖（merge 只认非 nil 字段），
 	// 与 client.go / server.go 的写法保持一致；这样下面解引用不用再判 nil
+	const defaultHeartInterval = 5 * time.Second
 	opt := ConnOptions().
-		SetHeartInterval(5 * time.Second).
+		SetHeartInterval(defaultHeartInterval).
 		SetReadTimeoutFactor(2.2). // 允许丢 1 个心跳，并允许第 2 个晚到 20%
 		SetWriteTimeoutFactor(2.2).
 		SetHandshakeTimeout(5 * time.Second).
 		merges(opts...)
+
+	if *opt.HeartInterval <= 0 {
+		slog.Warn("invalid heart interval, fallback to default", "got", *opt.HeartInterval, "default", defaultHeartInterval)
+		*opt.HeartInterval = defaultHeartInterval
+	}
 
 	c := &Conn{
 		conn:             conn,
@@ -184,11 +195,13 @@ func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 		handshakeTimeout: *opt.HandshakeTimeout,
 		sendChan:         make(chan *frame, sendChanSize),
 		bufs:             make(net.Buffers, 0, maxBatchFrames*2),
+		msgChan:          make(chan []byte, msgChanSize),
 	}
 	c.closed.Store(false)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 
 	c.nextDeadline = time.Now().Add(c.readTimeout)
+	go c.msgWorker()
 	return c, nil
 }
 
@@ -202,13 +215,14 @@ func (this *Conn) Close() error {
 // 只有第一个调用者真正执行关闭并返回底层错误；后续调用是空操作，返回 nil，
 // 想知道连接为什么结束用 Err()。
 func (this *Conn) CloseWithError(err error) error {
-	if err != nil {
-		this.l.Lock()
-		if this.closeErr == nil {
-			this.closeErr = err
-		}
-		this.l.Unlock()
+	if err == nil {
+		err = ErrConnClosed
 	}
+	this.l.Lock()
+	if this.closeErr == nil {
+		this.closeErr = err
+	}
+	this.l.Unlock()
 	if !this.closed.CompareAndSwap(false, true) {
 		return nil
 	}
@@ -236,6 +250,7 @@ func (this *Conn) Serve() error {
 	this.nextDeadline = dl
 	if err := this.conn.SetReadDeadline(dl); err != nil {
 		this.CloseWithError(fmt.Errorf("set read deadline: %w", err))
+		return this.Err()
 	}
 
 	var wg sync.WaitGroup
@@ -266,7 +281,7 @@ func (this *Conn) SetHandler(h Handler) {
 // Write 把 datas 组成一帧/多帧并直接落盘，绕过 sendChan。
 // 只允许在 Serve() 之前用（握手）：那时 writePump 还没起，不存在并发写，
 // 也就不会和 this.bufs / sendChan 抢。
-func (this *Conn) Write(datas ...[]byte) error {
+func (this *Conn) Write(datas ...[]byte) (err error) {
 	var bufs net.Buffers
 	frames := make([]*frame, 0, len(datas))
 	for _, data := range datas {
@@ -275,6 +290,7 @@ func (this *Conn) Write(datas ...[]byte) error {
 			for _, x := range frames {
 				x.Release()
 			}
+			// 参数非法（如超长帧）是可恢复的调用错误，不能把连接当致命故障关掉。
 			return err
 		}
 		frames = append(frames, f)
@@ -289,10 +305,14 @@ func (this *Conn) Write(datas ...[]byte) error {
 		}
 	}()
 	if err := this.conn.SetWriteDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
-		return fmt.Errorf("set write deadline: %w", err)
+		err = fmt.Errorf("set write deadline: %w", err)
+		this.CloseWithError(err)
+		return err
 	}
 	if _, err := bufs.WriteTo(this.conn); err != nil {
-		return fmt.Errorf("write frame: %w", err)
+		err = fmt.Errorf("write frame: %w", err)
+		this.CloseWithError(err)
+		return err
 	}
 	return nil
 }
@@ -330,13 +350,6 @@ func (this *Conn) write(flag byte, data []byte) error {
 	}
 	select {
 	case this.sendChan <- f:
-		// 入队和 Close 之间没有原子性：可能刚 check 完 closed=false，
-		// 另一边就 CAS 成功并 cancel 了，select 两个 case 同时就绪时是随机选，
-		// 于是帧进了一个已经没有消费者的队列。这里补一次检查，
-		// 把"静默丢一条"变成"如实报错"。
-		if this.closed.Load() {
-			return this.closedErr()
-		}
 		return nil
 	case <-this.ctx.Done():
 		f.Release()
@@ -459,6 +472,15 @@ func (this *Conn) writePump() (err error) {
 		for _, f := range batch {
 			f.Release()
 		}
+	loop:
+		for {
+			select {
+			case f := <-this.sendChan:
+				f.Release()
+			default:
+				break loop
+			}
+		}
 	}()
 
 	for {
@@ -533,16 +555,11 @@ func (this *Conn) readPump() error {
 		switch flag {
 		case flag_msg:
 			if this.handler != nil {
-				func() {
-					defer func() {
-						if r := recover(); r != nil {
-							slog.Error("handler panic", "err", r)
-						}
-					}()
-					if err := this.handler.HandleMsg(body); err != nil {
-						slog.Error("handler msg", "err", err)
-					}
-				}()
+				select {
+				case this.msgChan <- body:
+				case <-this.ctx.Done():
+					return nil
+				}
 			}
 		case flag_ping:
 			// 收到 PING，回复 PONG
@@ -552,5 +569,41 @@ func (this *Conn) readPump() error {
 		default:
 			return fmt.Errorf("unknown flag: %d", flag)
 		}
+	}
+}
+
+// msgWorker 是每条连接唯一的业务帧消费者，保证 Handler 严格按收包顺序串行执行。
+// readPump 只入队，慢 Handler 不会阻塞读泵，因此心跳和 Close 都不受影响。
+// 连接关闭后先把队列里已经收到的帧处理完再退出。
+func (this *Conn) msgWorker() {
+	for {
+		select {
+		case body := <-this.msgChan:
+			this.dispatchMsg(body)
+		case <-this.ctx.Done():
+			for {
+				select {
+				case body := <-this.msgChan:
+					this.dispatchMsg(body)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (this *Conn) dispatchMsg(body []byte) {
+	h := this.handler
+	if h == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("handler panic", "err", r)
+		}
+	}()
+	if err := h.HandleMsg(body); err != nil {
+		slog.Error("handler msg", "err", err)
 	}
 }
