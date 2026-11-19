@@ -210,7 +210,7 @@ func assertRoundtrip(t *testing.T, coderType T, v any) {
 		t.Fatalf("Encode(%v, %T) err: %v", coderType, v, err)
 	}
 	dst := reflect.New(reflect.TypeOf(v))
-	rest, err := Unmarshal(coderType, b, dst.Interface())
+	rest, err := Decode(coderType, b, dst.Interface())
 	if err != nil {
 		t.Fatalf("Unmarshal(%v, %T) err: %v", coderType, v, err)
 	}
@@ -238,7 +238,7 @@ func assertBatch(t *testing.T, coderType T, batch []any) {
 	for i, v := range batch {
 		dst := reflect.New(reflect.TypeOf(v))
 		var err error
-		rest, err = Unmarshal(coderType, rest, dst.Interface())
+		rest, err = Decode(coderType, rest, dst.Interface())
 		if err != nil {
 			t.Fatalf("Unmarshal(%v, batch[%d] %T): %v", coderType, i, v, err)
 		}
@@ -304,7 +304,7 @@ func BenchmarkDecode(b *testing.B) {
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				dst := reflect.New(typ)
-				if _, err := Unmarshal(Msgp, encoded, dst.Interface()); err != nil {
+				if _, err := Decode(Msgp, encoded, dst.Interface()); err != nil {
 					b.Fatal(err)
 				}
 			}

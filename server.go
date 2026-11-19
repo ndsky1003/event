@@ -352,7 +352,13 @@ func (this *server) handle(sid uint32, sname string, frame *msg.Msg) {
 
 func (this *server) on(sid uint32, frame *msg.Msg) {
 	en := frame.EventName
-	tp := topic.New(en)
+	tp, err := topic.New(en)
+	if err != nil {
+		// 正则编译失败：回传错误，客户端 resolve 会感知并（重试时仍失败）暴露出来。
+		frame.Err = err.Error()
+		this.write(sid, frame)
+		return
+	}
 	this.l.Lock()
 	var ts *topicSids
 	if tp.IsReg {

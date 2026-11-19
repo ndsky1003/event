@@ -1,5 +1,33 @@
 package coder
 
+// 本文件是事件参数的 msgpack 编解码器，内部有两条路径：
+//
+//   - msgp 快路径：v 实现 tinylib/msgp 的 msgp.Marshaler / msgp.Unmarshaler
+//     （业务方 codegen 生成）时走这条，基于 []byte、零分配。
+//   - msgpack 反射回退：其余类型走 vmihailenco/msgpack 反射编码。
+//
+// 两条路径产出的都是标准 MessagePack 字节（struct 默认 map 格式），因此可互通：
+// 一个进程用 msgp 编码、另一个进程用 msgpack 解码，或反之。
+//
+// 互通的前提与约定：
+//
+//  1. struct 必须都用 map 格式（msgp 默认、msgpack 默认都是 map），且字段名（map key）
+//     两端对齐：msgp codegen 认 msgpack:"..." tag，msgpack 反射默认用字段名。
+//
+//  2. 可 nil 的容器字段（map / slice / []byte）必须加 allownil tag，例如：
+//
+//     type Foo struct {
+//     M map[string]int `msgpack:"m,allownil"`
+//     S []string       `msgpack:"s,allownil"`
+//     B []byte         `msgpack:"b,allownil"`
+//     }
+//
+//     原因：msgpack 反射把 nil 容器编码为 nil（0xc0），而 msgp codegen 默认把 nil 容器
+//     编码为 empty（len(nil)==0），且解码时 ReadMapHeaderBytes / ReadArrayHeaderBytes
+//     无法读 nil。加了 allownil 后，msgp 对 nil 容器编码为 nil、解码也能读 nil，
+//     与 msgpack 反射对齐，双向互通才成立；否则「msgpack 编码的 nil 容器交给 msgp 解码」
+//     会报错（见 msgpack_msgp_interop_test.go 的 TestMsgpackMsgpNilContainer）。
+
 import (
 	"bytes"
 	"reflect"

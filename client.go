@@ -3,6 +3,7 @@ package event
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"net"
 	"reflect"
@@ -25,15 +26,11 @@ var bodyPool = sync.Pool{
 	},
 }
 
-func init() {
-	logrus.SetReportCaller(true)
-}
-
 // 锁顺序固定为 rwl -> l。任何持 l 的代码路径都不得再去拿 rwl，
 // 否则会和 On / regist_topic_lock / Stop 交叉死锁（原代码 FIXME 承认的那个问题）。
 type Client struct {
 	url       string
-	seq       uint64
+	seq       atomic.Uint64
 	opt       *ClientOption
 	coderType coder.T //事件参数的编码方式,可通过 ClientOption.SetCoderType 注入
 
@@ -107,7 +104,7 @@ func (this *Client) keepAlive() {
 			return
 		}
 		if err := this.connect(); err != nil {
-			logrus.Error(err)
+			slog.Error("err", "err", err)
 		}
 		if this.isStopped() {
 			return
@@ -317,7 +314,7 @@ func (this *Client) parse(coderType coder.T, req_body_data []byte, req_args_coun
 		argType := m.argsType[i]
 		argValue := reflect.New(argType.at)
 		if i < req_args_count {
-			if rest, err = coder.Unmarshal(coderType, rest, argValue.Interface()); err != nil {
+			if rest, err = coder.Decode(coderType, rest, argValue.Interface()); err != nil {
 				ft := m.function.Type()
 				err = fmt.Errorf("%w,parse func[%v] body [%v] arg err:%w", ErrClient, ft, i, err)
 				return
@@ -504,7 +501,7 @@ func (this *Client) emit(t msgtype.T, en eventname.T, args ...any) error {
 }
 
 func (this *Client) send(call *Call) {
-	seq := atomic.AddUint64(&this.seq, 1)
+	seq := this.seq.Add(1)
 	call.Msg.Seq = seq
 
 	this.l.Lock()

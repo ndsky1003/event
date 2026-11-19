@@ -1,6 +1,7 @@
 package event
 
 import (
+	"errors"
 	"reflect"
 
 	"github.com/ndsky1003/event/v2/eventname"
@@ -26,43 +27,49 @@ func (this *Client) EmitSomeOneAsnyc(en eventname.T, args ...any) *Call {
 
 // 监听事件
 // if t is reg , first param must the value of reg.FindStringSubmatch(et)
-func (this *Client) On(t eventname.T, Func any) {
+func (this *Client) On(t eventname.T, Func any) error {
 	if t == "" {
-		panic("eventname must not empty")
+		return errors.New("eventname must not empty")
 	}
 	rt := reflect.TypeOf(Func)
 	if rt.Kind() != reflect.Func {
-		panic("on a not func")
+		return errors.New("on a not func")
 	}
 	if rt.NumOut() != 1 {
-		panic("on regist func must has 1 return value")
+		return errors.New("on regist func must has 1 return value")
 	}
 	if rt.Out(0) != errType {
-		panic("on regist func must has 1 return value of error")
+		return errors.New("on regist func must has 1 return value of error")
+	}
+	rv := reflect.ValueOf(Func)
+	if !rv.IsValid() {
+		return errors.New("regist func is nil")
 	}
 	inCount := rt.NumIn()
 	length := inCount
-	newtp := topic.New(t)
+	newtp, err := topic.New(t)
+	if err != nil {
+		return err
+	}
 	var inStart int
 	if newtp.IsReg {
 		if inCount < 1 {
-			panic("regist reg Func, first param must exist")
+			return errors.New("regist reg Func, first param must exist")
 		}
 		if rt.In(0) != sliceType {
-			panic("regist reg Func, first param must []string type")
+			return errors.New("regist reg Func, first param must []string type")
 		}
 		inStart = 1
 		inCount = inCount - 1
 	}
 
-	var argsType = make([]*argType, 0, inCount)
+	argsType := make([]*argType, 0, inCount)
 	for i := inStart; i < length; i++ {
 		at := rt.In(i)
 		argsType = append(argsType, &argType{at: at})
 	}
-	ft := reflect.ValueOf(Func)
 	mType := &method{
-		function:  ft,
+		function:  rv,
 		argsType:  argsType,
 		argsCount: inCount,
 	}
@@ -94,4 +101,5 @@ func (this *Client) On(t eventname.T, Func any) {
 		// 所以这里不会阻塞在"没连接"上。
 		this.regist_topic()
 	}
+	return nil
 }

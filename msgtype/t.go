@@ -21,7 +21,7 @@ const (
 	ResRandOne //响应
 )
 
-var m = map[T]string{
+var m = [...]string{
 	Invalid:    "Invalid",
 	Ping:       "Ping",
 	Pong:       "Pong",
@@ -34,9 +34,8 @@ var m = map[T]string{
 }
 
 func (this T) String() string {
-	if s, ok := m[this]; ok {
-		return s
-	} else {
-		return fmt.Sprintf("未知:%d", uint8(this))
+	if int(this) < len(m) && m[this] != "" {
+		return m[this]
 	}
+	return fmt.Sprintf("未知:%d", uint8(this))
 }

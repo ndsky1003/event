@@ -43,7 +43,7 @@ func decodeEnvelope(body []byte, v any) (coder.T, error) {
 		return 0, fmt.Errorf("envelope too short:%d", len(body))
 	}
 	t := coder.T(body[0])
-	if _, err := coder.Unmarshal(t, body[envelopeTagLen:], v); err != nil {
+	if _, err := coder.Decode(t, body[envelopeTagLen:], v); err != nil {
 		return t, fmt.Errorf("coder:%v decode envelope err:%w", t, err)
 	}
 	return t, nil
