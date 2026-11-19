@@ -19,12 +19,13 @@ const (
 	flag_ping
 	flag_pong
 )
+const magic = 0xAA
 
 const (
-	// 帧格式：[flag 1 字节][body 长度 4 字节 BigEndian][body]
+	// 帧格式：[magic 1 字节][flag 1 字节][body 长度 4 字节 BigEndian][body]
 	// 帧与帧背靠背相连，一帧最多占 2 个 iovec（hdr + body），由 net.Buffers 一次 writev 发出
-	frameHeaderSize = 5
-	maxFrameSize    = 64 << 10
+	frameHeaderSize = 1 + 1 + 4 //magic+flag+size
+	maxFrameSize    = 64 << 10  //64KB
 	// IOV_MAX = 1024，每帧最多 2 个 iovec，所以一批最多 512 帧
 	maxBatchFrames = 512
 	sendChanSize   = 30
@@ -111,6 +112,18 @@ type frame struct {
 	body []byte
 }
 
+func newFrame(flag byte, data []byte) (*frame, error) {
+	if len(data) > maxFrameSize {
+		return nil, fmt.Errorf("frame size %d exceeds maximum %d", len(data), maxFrameSize)
+	}
+	f := framePool.Get().(*frame)
+	f.hdr[0] = magic
+	f.hdr[1] = flag
+	binary.BigEndian.PutUint32(f.hdr[2:], uint32(len(data)))
+	f.body = data
+	return f, nil
+}
+
 var framePool = sync.Pool{
 	New: func() any { return new(frame) },
 }
@@ -122,7 +135,7 @@ func (this *frame) Release() {
 }
 
 type Conn struct {
-	net.Conn
+	conn net.Conn
 	r    *bufio.Reader
 	hbuf [frameHeaderSize]byte // 读侧帧头，只有 readPump 一个 goroutine 用
 
@@ -147,7 +160,7 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	l        sync.Mutex // protect closeErr
+	l        sync.Mutex
 	closeErr error
 }
 
@@ -155,14 +168,14 @@ func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 	// 先铺默认值，再让调用方的 opts 覆盖（merge 只认非 nil 字段），
 	// 与 client.go / server.go 的写法保持一致；这样下面解引用不用再判 nil
 	opt := ConnOptions().
-		SetHeartInterval(10 * time.Second).
+		SetHeartInterval(5 * time.Second).
 		SetReadTimeoutFactor(2.2). // 允许丢 1 个心跳，并允许第 2 个晚到 20%
 		SetWriteTimeoutFactor(2.2).
 		SetHandshakeTimeout(5 * time.Second).
 		merges(opts...)
 
 	c := &Conn{
-		Conn:             conn,
+		conn:             conn,
 		r:                bufio.NewReaderSize(conn, 16<<10),
 		handler:          handler,
 		heartInterval:    *opt.HeartInterval,
@@ -200,7 +213,7 @@ func (this *Conn) CloseWithError(err error) error {
 		return nil
 	}
 	this.cancel()
-	return this.Conn.Close()
+	return this.conn.Close()
 }
 
 // Err 返回连接关闭的原因；未关闭返回 nil，主动 Close 返回 ErrConnClosed
@@ -221,7 +234,7 @@ func (this *Conn) Serve() error {
 	// 之后由 readPump 按检查点续期、writePump 的看门狗判死。
 	dl := time.Now().Add(this.readTimeout)
 	this.nextDeadline = dl
-	if err := this.SetReadDeadline(dl); err != nil {
+	if err := this.conn.SetReadDeadline(dl); err != nil {
 		this.CloseWithError(fmt.Errorf("set read deadline: %w", err))
 	}
 
@@ -250,47 +263,47 @@ func (this *Conn) SetHandler(h Handler) {
 	this.handler = h
 }
 
-// writeSync 直接写一帧并落盘，绕过 sendChan。
+// Write 把 datas 组成一帧/多帧并直接落盘，绕过 sendChan。
 // 只允许在 Serve() 之前用（握手）：那时 writePump 还没起，不存在并发写，
 // 也就不会和 this.bufs / sendChan 抢。
-func (this *Conn) writeSync(flag byte, data []byte) error {
-	f, err := newFrame(flag, data)
-	if err != nil {
-		return err
+func (this *Conn) Write(datas ...[]byte) error {
+	var bufs net.Buffers
+	frames := make([]*frame, 0, len(datas))
+	for _, data := range datas {
+		f, err := newFrame(flag_msg, data)
+		if err != nil {
+			for _, x := range frames {
+				x.Release()
+			}
+			return err
+		}
+		frames = append(frames, f)
+		bufs = append(bufs, f.hdr[:])
+		if len(f.body) > 0 {
+			bufs = append(bufs, f.body)
+		}
 	}
-	defer f.Release()
-
-	if err = this.SetWriteDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+	defer func() {
+		for _, f := range frames {
+			f.Release()
+		}
+	}()
+	if err := this.conn.SetWriteDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
 		return fmt.Errorf("set write deadline: %w", err)
 	}
-	bufs := net.Buffers{f.hdr[:]}
-	if len(f.body) > 0 {
-		bufs = append(bufs, f.body)
-	}
-	if _, err = bufs.WriteTo(this.Conn); err != nil {
+	if _, err := bufs.WriteTo(this.conn); err != nil {
 		return fmt.Errorf("write frame: %w", err)
 	}
 	return nil
 }
 
-// readSync 直接读一帧。同样只允许在 Serve() 之前调用。
-func (this *Conn) readSync() (flag byte, body []byte, err error) {
-	if err = this.SetReadDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
-		return 0, nil, fmt.Errorf("set read deadline: %w", err)
+// Read 直接读一帧。同样只允许在 Serve() 之前调用。
+func (this *Conn) Read() (body []byte, err error) {
+	if err = this.conn.SetReadDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+		return nil, fmt.Errorf("set read deadline: %w", err)
 	}
-	return this.read()
-}
-
-// newFrame 组帧：填 flag + 4 字节长度，body 只引用不复制
-func newFrame(flag byte, data []byte) (*frame, error) {
-	if len(data) > maxFrameSize {
-		return nil, fmt.Errorf("frame size %d exceeds maximum %d", len(data), maxFrameSize)
-	}
-	f := framePool.Get().(*frame)
-	f.hdr[0] = flag
-	binary.BigEndian.PutUint32(f.hdr[1:], uint32(len(data)))
-	f.body = data
-	return f, nil
+	_, body, err = this.read()
+	return
 }
 
 // closedErr 返回连接关闭的原因，保证非 nil。
@@ -373,7 +386,7 @@ func (this *Conn) writeBatch(frames []*frame) error {
 	now := time.Now()
 	if this.nextWriteDeadline.IsZero() || now.After(this.nextWriteDeadline.Add(-this.writeTimeout/4)) {
 		this.nextWriteDeadline = now.Add(this.writeTimeout)
-		if err := this.SetWriteDeadline(this.nextWriteDeadline); err != nil {
+		if err := this.conn.SetWriteDeadline(this.nextWriteDeadline); err != nil {
 			return fmt.Errorf("set write deadline: %w", err)
 		}
 	}
@@ -381,27 +394,31 @@ func (this *Conn) writeBatch(frames []*frame) error {
 	// 必须传 this.Conn，不能传 this：
 	// *net.TCPConn 实现了 buffersWriter 才会走 writev，*Conn 没实现会退化成逐个 Write。
 	// 另外 WriteTo 会消费它拿到的那个 slice header，所以转一个临时值出去，保住 this.bufs。
-	bufs := net.Buffers(this.bufs)
-	if _, err := bufs.WriteTo(this.Conn); err != nil {
+	bufs := this.bufs
+	if _, err := bufs.WriteTo(this.conn); err != nil {
 		// writev 部分写后出错，字节流已经错位，这条连接只能关掉
 		return fmt.Errorf("writev %d frames: %w", len(frames), err)
 	}
 	return nil
 }
 
-// read 读一帧。固定 5 字节头，一次 ReadFull 就能拿到，不用 varint 逐字节读。
+// read 读一帧。固定 6 字节头（magic+flag+size），一次 ReadFull 就能拿到。
 func (this *Conn) read() (flag byte, body []byte, err error) {
 	if _, err = io.ReadFull(this.r, this.hbuf[:]); err != nil {
 		return
 	}
-	flag = this.hbuf[0]
-	size := binary.BigEndian.Uint32(this.hbuf[1:])
+	if this.hbuf[0] != magic {
+		err = fmt.Errorf("bad magic: 0x%x", this.hbuf[0])
+		return
+	}
+	flag = this.hbuf[1]
+	size := binary.BigEndian.Uint32(this.hbuf[2:])
 	if size > maxFrameSize {
 		err = fmt.Errorf("frame size %d exceeds maximum %d", size, maxFrameSize)
 		return
 	}
 	if size == 0 {
-		// PING / PONG 帧只有 5 字节头
+		// PING / PONG 帧只有 6 字节头
 		return
 	}
 	body = make([]byte, size)
@@ -498,7 +515,7 @@ func (this *Conn) readPump() error {
 
 		if now.After(this.nextDeadline.Add(-this.heartInterval)) {
 			this.nextDeadline = now.Add(this.readTimeout)
-			if err := this.SetReadDeadline(this.nextDeadline); err != nil {
+			if err := this.conn.SetReadDeadline(this.nextDeadline); err != nil {
 				return fmt.Errorf("set read deadline: %w", err)
 			}
 		}

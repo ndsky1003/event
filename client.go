@@ -171,11 +171,11 @@ func (this *clientConn) handshake() error {
 	if err != nil {
 		return fmt.Errorf("%w,encode verify req err:%w", ErrClient, err)
 	}
-	if err = this.conn.writeSync(flag_msg, body); err != nil {
+	if err = this.conn.Write(body); err != nil {
 		return fmt.Errorf("%w,write verify req err:%w", ErrClient, err)
 	}
 
-	_, body, err = this.conn.readSync()
+	body, err = this.conn.Read()
 	if err != nil {
 		return fmt.Errorf("%w,read verify res err:%w", ErrClient, err)
 	}

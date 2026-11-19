@@ -51,7 +51,7 @@ func newService(server *server, id uint32, conn *Conn) *service {
 // 那时 readPump/writePump 都还没起，只有当前 goroutine 碰 socket，
 // 所以可以用 writeSync/readSync 这种同步读写。
 func (this *service) handshake() error {
-	_, body, err := this.conn.readSync()
+	body, err := this.conn.Read()
 	if err != nil {
 		return fmt.Errorf("%w,read verify req:%w", ErrServer, err)
 	}
@@ -77,7 +77,7 @@ func (this *service) writeHandshakeRes(res *msg.MsgVerifyRes) error {
 	if err != nil {
 		return fmt.Errorf("%w,encode verify res:%w", ErrServer, err)
 	}
-	if err = this.conn.writeSync(flag_msg, body); err != nil {
+	if err = this.conn.Write(body); err != nil {
 		return fmt.Errorf("%w,write verify res:%w", ErrServer, err)
 	}
 	return nil
