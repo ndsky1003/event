@@ -16,18 +16,10 @@ import (
 	"github.com/ndsky1003/event/v2/eventname"
 	"github.com/ndsky1003/event/v2/msg"
 	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/sirupsen/logrus"
 )
 
-// var bodyPool = sync.Pool{
-// 	New: func() any {
-// 		b := make([]byte, 0, 1024)
-// 		return b
-// 	},
-// }
-
-// 锁顺序固定为 rwl -> l。任何持 l 的代码路径都不得再去拿 rwl，
-// 否则会和 On / regist_topic_lock / Stop 交叉死锁（原代码 FIXME 承认的那个问题）。
+// 锁顺序固定为 rwl -> l：持 l 的代码路径不得再去拿 rwl，
+// 否则会和 On / regist_topic_lock 交叉死锁。
 type Client struct {
 	url    string
 	seq    atomic.Uint64
@@ -36,10 +28,10 @@ type Client struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	rwl    sync.RWMutex // protect topics，只有 on 的时候写
+	rwl    sync.RWMutex // protect topics 与 conn；On / SetConn / disconnect / Close 写
 	topics []topicEntry
 
-	l       sync.Mutex // protect cc / pending / connecting / stopped
+	l       sync.Mutex // protect conn / pending
 	conn    *Conn
 	pending map[uint64]*Call
 }
@@ -63,10 +55,18 @@ func Dial(url string, opts ...*ClientOption) *Client {
 	return c
 }
 
+// maxBackoffFactor 重连退避的上限倍数：拨号/握手连续失败时，间隔从
+// check_interval 指数翻倍，封顶到 check_interval * maxBackoffFactor（默认 2s → 32s）。
+const maxBackoffFactor = 16
+
 // keepAlive 拨号 → 握手 → 跑连接 → 断了再连。
 // 心跳与断连检测已经下沉到 Conn 的看门狗，这里不再发应用层 Ping。
-// Close 之后退出，不再重连。
+// 拨号/握手失败时指数退避（避免服务器不可达时疯狂重试刷日志），
+// 连接成功建立过则退避归零。Close 之后退出，不再重连。
 func (this *Client) keepAlive() {
+	interval := *this.opt.check_interval
+	backoff := interval
+	maxBackoff := interval * maxBackoffFactor
 	for {
 		select {
 		case <-this.ctx.Done():
@@ -80,24 +80,42 @@ func (this *Client) keepAlive() {
 		if err != nil {
 			slog.Error("keepAlive", "err", err)
 		}
-		time.Sleep(*this.opt.check_interval) //下次去尝试连接
+
+		// 拨号/握手失败则指数退避，成功建立过则归零
+		if conn == nil {
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		} else {
+			backoff = interval
+		}
+
+		// 重连间隔（响应 Close，不再用 time.Sleep）
+		select {
+		case <-time.After(backoff):
+		case <-this.ctx.Done():
+			return
+		}
 	}
 }
 
-// connect 建立一条连接并阻塞到它结束，返回连接终止的原因
+// connect 建立连接、完成握手，然后阻塞到连接结束，返回连接与终止原因。
+// 握手失败会关闭连接并置 conn 为 nil，避免泄漏尚未 Serve 的连接。
 func (this *Client) connect(ctx context.Context) (conn *Conn, err error) {
 	raw, err := net.Dial("tcp", this.url)
 	if err != nil {
-		err = fmt.Errorf("%w Dail err:%w", ErrClient, err)
-		return
+		return nil, fmt.Errorf("%w dial err: %w", ErrClient, err)
 	}
 	conn = New(ctx, raw, this, &this.opt.connOption)
 	if err = this.handshake(conn); err != nil {
-		return
+		conn.CloseWithError(err)
+		return nil, err
 	}
 	this.SetConn(conn)
+	go this.regist_topic()
 	err = conn.Serve()
-	return
+	return conn, err
 }
 
 // handshake 在 pump 启动前完成鉴权。必须单 goroutine 调用。
@@ -128,7 +146,7 @@ func (this *Client) handshake(conn *Conn) error {
 	return nil
 }
 
-// HandleMsg 实现 Handler，由这条连接的 readPump 同步调用。
+// HandleMsg 实现 Handler，由这条连接的 msgWorker 串行调用。
 // PING/PONG 已在传输层消化，不会走到这里。
 func (this *Client) HandleMsg(body []byte) error {
 	var got msg.Msg
@@ -141,7 +159,7 @@ func (this *Client) HandleMsg(body []byte) error {
 	case msgtype.Res, msgtype.ResRandOne, msgtype.On:
 		this.resolve(&got)
 	default:
-		logrus.Infof("%v,invalid msg:%+v", ErrClient, got)
+		slog.Info("invalid msg", "msg", got)
 	}
 	return nil
 }
@@ -167,6 +185,9 @@ func (this *Client) resolve(got *msg.Msg) {
 	}
 	call.done()
 }
+
+// SetConn 换上新的连接，关闭旧连接并结算它欠的 pending。
+// 只在 connect 成功握手后调用；重连成功后旧连接上未完成的响应一并作废。
 func (this *Client) SetConn(conn *Conn) {
 	this.rwl.Lock()
 	defer this.rwl.Unlock()
@@ -179,6 +200,8 @@ func (this *Client) SetConn(conn *Conn) {
 	this.stopLocked(fmt.Errorf("%w,reset connection", ErrClient))
 }
 
+// disconnect 在连接结束时收尾：清掉 conn 指针并结算它欠的 pending。
+// 仅当当前连接就是 conn 时才处理，避免迟到的旧连接事件污染新连接。
 func (this *Client) disconnect(conn *Conn) {
 	this.rwl.Lock()
 	defer this.rwl.Unlock()
@@ -191,13 +214,20 @@ func (this *Client) disconnect(conn *Conn) {
 	}
 }
 
-func (this *Client) Close() {
-	this.CloseWithErr(fmt.Errorf("%w shutdown", ErrClient))
+// Close 关闭客户端并终止重连循环，幂等。第一次调用返回关闭原因（ErrClient 包装），
+// 之后返回 nil。返回值仅是原因说明，关闭本身不会失败，可安全忽略。
+func (this *Client) Close() error {
+	return this.CloseWithErr(fmt.Errorf("%w shutdown", ErrClient))
 }
 
+// CloseWithErr 关闭客户端并指定关闭原因。幂等：只有第一个调用者真正执行关闭并
+// 返回该原因，后续调用返回 nil。err 为 nil 时回退为 ErrClient。
 func (this *Client) CloseWithErr(err error) error {
 	if !this.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	if err == nil {
+		err = ErrClient
 	}
 	this.rwl.Lock()
 	defer this.rwl.Unlock()
@@ -205,11 +235,10 @@ func (this *Client) CloseWithErr(err error) error {
 	defer this.l.Unlock()
 
 	this.cancel()
-	if c := this.conn; c == nil {
-		return nil
+	if this.conn != nil {
+		this.conn = nil
+		this.stopLocked(fmt.Errorf("%w,%w client closed", ErrClient, err))
 	}
-	this.conn = nil
-	this.stopLocked(fmt.Errorf("%w,%w client closed", ErrClient, err))
 	return err
 }
 
@@ -255,6 +284,18 @@ func (this *Client) func_call(req *msg.Msg) {
 		Seq:       req.Seq,
 		EventName: et,
 	}
+	// 回调 panic 时兜底回一个错误包：否则服务端 pending 干等 Timeout（默认 10s）。
+	// 这里的 recover 只保护当前 goroutine（func_call 是被 go 出来的），
+	// dispatchMsg 的 recover 覆盖不到它。
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("func_call panic", "event", et, "err", r)
+			res.Err = fmt.Errorf("%w,回调 panic:%v", ErrClient, r).Error()
+			if err := this.Write(res); err != nil {
+				slog.Error("func_call write res", "err", err)
+			}
+		}
+	}()
 	this.rwl.RLock()
 	var isHaveTP bool
 	var topics_tmp []topicEntry
@@ -295,12 +336,12 @@ func (this *Client) func_call(req *msg.Msg) {
 	}
 
 	if err := this.Write(res); err != nil {
-		logrus.Error(err)
+		slog.Error("func_call write res", "err", err)
 	}
 }
 
-// Write 编码并发送一条消息。失败只返回错误，连接收尾交给 readPump/Serve，
-// 不在这里递归调用 Stop（旧实现里 Write→stop→Write 可能重入）。
+// Write 编码并发送一条消息。消息框架固定用 coder.Msgp（与服务端一致），
+// 事件参数才走 Msg.Coder 声明的编码。失败只返回错误，连接收尾交给 Serve 的收尾流程。
 func (this *Client) Write(m *msg.Msg) error {
 	var c *Conn
 	this.l.Lock()
@@ -309,7 +350,7 @@ func (this *Client) Write(m *msg.Msg) error {
 	if c == nil {
 		return fmt.Errorf("%w client connection is nil", ErrClient)
 	}
-	body, err := coder.Encode(*this.opt.coder_type, nil, m)
+	body, err := coder.Encode(coder.Msgp, nil, m)
 	if err != nil {
 		return fmt.Errorf("%w, err:%w", ErrClient, err)
 	}
@@ -317,12 +358,22 @@ func (this *Client) Write(m *msg.Msg) error {
 
 }
 
-// regist_topic 把 On 注册的 topic 上报给服务端。
-// 连接没起来或已断就直接返回——connect() 成功后会再拉一次，不必空转报错。
+// regist_topic 把 On 注册的 topic 上报给服务端，失败则隔 2s 重试直到全部成功。
+// 它同步阻塞 On，保证 On 返回时 topic 已在服务端就位，紧随其后的 Emit 不会落空。
+// Close 之后退出：循环和重试等待都检查 ctx.Done，避免服务器不可达时 On 永久阻塞。
 func (this *Client) regist_topic() {
 	for {
+		select {
+		case <-this.ctx.Done():
+			return
+		default:
+		}
 		if err := this.regist_topic_lock(); err != nil {
-			time.Sleep(2 * time.Second)
+			select {
+			case <-time.After(2 * time.Second):
+			case <-this.ctx.Done():
+				return
+			}
 			continue
 		}
 		return
@@ -380,7 +431,7 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, opt SendOption, args
 		var err error
 		for _, arg := range args {
 			if m.Bytes, err = coder.Encode(m.Coder, m.Bytes, arg); err != nil {
-				err = fmt.Errorf("%w %w current err:%w", ErrClient, ErrClientEncode, err)
+				err = fmt.Errorf("%w: %w", ErrClientEncode, err)
 				break
 			}
 		}

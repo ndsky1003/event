@@ -322,10 +322,14 @@ func (this *Conn) closedErr() error {
 	return ErrConnClosed
 }
 
-// write 组帧并投递到 sendChan，供外部 goroutine（Emit 等）调用。
+// Write 组帧并投递到 sendChan，供外部 goroutine（Emit 等）调用。
 // 通道满时阻塞，直到写出去、ctx 结束或连接关闭。
-// 注意：返回只代表"已入队"，data 的所有权要等 writev 完成才真正交出去，
+// 返回只代表"已入队"，data 的所有权要等 writev 完成才真正交出去，
 // 调用方在此之前不能复用/归还 data。
+//
+// 入队成功即返回 nil，即使随后连接关闭、这帧最终没被 writePump 消费：
+// 连接关闭后 pending 会由上层（closeLocked / disconnect）统一结算，
+// 这里只负责"送没送进队列"，不做"有没有真的写出去"的保证。
 func (this *Conn) Write(data []byte) error {
 	if this.closed.Load() {
 		return this.closedErr()
@@ -343,9 +347,9 @@ func (this *Conn) Write(data []byte) error {
 	}
 }
 
-// tryWrite 非阻塞投递。通道满就返回 false，由调用方决定丢弃还是报错。
+// TryWrite 非阻塞投递。通道满就返回 false，由调用方决定丢弃还是报错。
 // pong 和 writePump 的心跳必须走这里：它们本身就在 writePump/readPump 里，
-// 用阻塞的 write 会自己等自己，直接死锁。
+// 用阻塞的 Write 会自己等自己，直接死锁。
 func (this *Conn) TryWrite(flag byte, data []byte) bool {
 	if this.closed.Load() {
 		return false
@@ -390,7 +394,7 @@ func (this *Conn) writeBatch(frames []*frame) error {
 		}
 	}
 
-	// 必须传 this.Conn，不能传 this：
+	// 必须传 this.conn，不能传 this：
 	// *net.TCPConn 实现了 buffersWriter 才会走 writev，*Conn 没实现会退化成逐个 Write。
 	// 另外 WriteTo 会消费它拿到的那个 slice header，所以转一个临时值出去，保住 this.bufs。
 	bufs := this.bufs
@@ -476,8 +480,8 @@ func (this *Conn) writePump() (err error) {
 			return nil
 		case f = <-this.sendChan:
 		case <-pingTimer.C:
-			// ping 走 tryWrite：writePump 自己是 sendChan 唯一的消费者，
-			// 用阻塞的 write 会自己等自己。通道满就跳过这个周期。
+			// ping 走 TryWrite：writePump 自己是 sendChan 唯一的消费者，
+			// 用阻塞的 Write 会自己等自己。通道满就跳过这个周期。
 			this.ping()
 			pingTimer.Reset(this.heartInterval)
 			continue

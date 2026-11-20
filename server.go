@@ -1,8 +1,10 @@
 package event
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -13,7 +15,6 @@ import (
 	"github.com/ndsky1003/event/v2/msg"
 	"github.com/ndsky1003/event/v2/msgtype"
 	"github.com/ndsky1003/event/v2/topic"
-	"github.com/sirupsen/logrus"
 )
 
 // topicSids 一个 topic 条目加上它的监听者集合。
@@ -53,8 +54,8 @@ type server_call struct {
 	origin_seq uint64          // frame.需要改成服务器的seq
 
 	serverReqCount uint64
-	// targets 这次请求实际投递给了哪些监听者。release_timeout 收尾时用它
-	// 把 service.inflight 里的残留清掉。
+	// targets 这次请求实际投递给了哪些监听者。closeLocked 摘连接时扫 pending，
+	// 用它找出这条连接欠着、还没回包的请求并立即结算。
 	targets []uint32
 	// settled 已经结算过的监听者。没有这张表，同一个 sid 被结算两次
 	// （先收到 Res、之后连接又断了）就会把 uint64 计数减成负数，
@@ -134,7 +135,7 @@ func (this *server) listen(url string) {
 	defer this.acceptWg.Done()
 
 	if this.closed.Load() {
-		logrus.Errorf("%v,server already shutdown,skip listen:%v", ErrServer, url)
+		slog.Error("server already shutdown, skip listen", "url", url)
 		return
 	}
 	listen, err := net.Listen("tcp", url)
@@ -145,7 +146,7 @@ func (this *server) listen(url string) {
 		// Shutdown 正好落在 net.Listen 和登记之间，listener 已被就地关掉
 		return
 	}
-	logrus.Infof("event server listening on %s", url)
+	slog.Info("event server listening", "url", url)
 
 	for {
 		conn, err := listen.Accept()
@@ -154,7 +155,7 @@ func (this *server) listen(url string) {
 			if this.closed.Load() {
 				return
 			}
-			logrus.Error(fmt.Errorf("%w,accept err:%w", ErrServer, err))
+			slog.Error("accept", "err", err)
 			// 不是 Shutdown 引起的 Accept 错误（fd 耗尽、临时资源不足之类）：
 			// 原来这里是裸 continue，等于忙循环，一瞬间能刷出几十万行日志。
 			time.Sleep(100 * time.Millisecond)
@@ -175,7 +176,7 @@ func (this *server) add_listener(l net.Listener) bool {
 	if this.closed.Load() {
 		this.l.Unlock()
 		if err := l.Close(); err != nil {
-			logrus.Errorf("%v,close listener err:%v", ErrServer, err)
+			slog.Error("close listener", "err", err)
 		}
 		return false
 	}
@@ -241,22 +242,16 @@ func (this *server) IsShutdown() bool {
 func (this *server) handle_conn(raw net.Conn) {
 	sid := atomic.AddUint32(&this.sid, 1)
 
-	conn, err := New(raw, nil, this.opt.connOptions())
-	if err != nil {
-		err = fmt.Errorf("%w,new conn err:%w", ErrServer, err)
-		if e := raw.Close(); e != nil {
-			err = fmt.Errorf("%w,%w", err, e)
-		}
-		logrus.Error(err)
-		return
-	}
+	// New 只起 msgWorker（handler 还是 nil，先不接消息），
+	// 真正的读写在 Serve() 里才起 readPump/writePump。
+	conn := New(context.Background(), raw, nil, this.opt.connOptions())
 	s := newService(this, sid, conn)
 	conn.SetHandler(s)
 
-	if err = s.handshake(); err != nil {
-		logrus.Error(err)
+	if err := s.handshake(); err != nil {
+		slog.Error("handshake", "err", err)
 		if e := conn.Close(); e != nil {
-			logrus.Errorf("%v,close conn err:%v", ErrServer, e)
+			slog.Error("close conn", "err", e)
 		}
 		return
 	}
@@ -266,22 +261,22 @@ func (this *server) handle_conn(raw net.Conn) {
 		// Shutdown 正好落在握手和登记之间：别把自己挂上去，直接收场
 		this.l.Unlock()
 		if e := conn.Close(); e != nil {
-			logrus.Errorf("%v,close conn err:%v", ErrServer, e)
+			slog.Error("close conn", "err", e)
 		}
 		return
 	}
 	this.services[sid] = s
 	this.l.Unlock()
-	logrus.Infof("event service:%s[%d] is ready", s.name, sid)
+	slog.Info("event service ready", "name", s.name, "sid", sid)
 
 	// Serve 阻塞到 readPump/writePump 都退出；心跳与断连检测由 Conn 负责
-	if err = conn.Serve(); err != nil && !errors.Is(err, ErrConnClosed) {
-		logrus.Errorf("service id:%d is die end,err:%v", sid, err)
+	if err := conn.Serve(); err != nil && !errors.Is(err, ErrConnClosed) {
+		slog.Error("service die", "sid", sid, "err", err)
 	}
 	// 连接结束：把自己从 topic/services 里摘掉，并结算它欠着的响应。
 	// 传 false 是因为连接已经关了，不需要再关一次。
 	this.Close(sid, false)
-	logrus.Infof("event service:%s[%d] exit", s.name, sid)
+	slog.Info("event service exit", "name", s.name, "sid", sid)
 }
 
 func (this *server) Close(sid uint32, isCloseSon bool) error {
@@ -345,7 +340,7 @@ func (this *server) handle(sid uint32, sname string, frame *msg.Msg) {
 	case msgtype.Res, msgtype.ResRandOne:
 		this.settle(sid, sname, frame)
 	default:
-		logrus.Infof("丢弃：%d,name:%v,msg:%+v\n", sid, sname, frame)
+		slog.Info("丢弃", "sid", sid, "name", sname, "msg", frame)
 	}
 
 }
@@ -354,12 +349,21 @@ func (this *server) on(sid uint32, frame *msg.Msg) {
 	en := frame.EventName
 	tp, err := topic.New(en)
 	if err != nil {
-		// 正则编译失败：回传错误，客户端 resolve 会感知并（重试时仍失败）暴露出来。
-		frame.Err = err.Error()
-		this.write(sid, frame)
+		// 非法正则（正常客户端已在 On 里用 topic.New 校验过，这里几乎只有伪造消息）：
+		// 永久错误，重试也没用，直接断开这条连接，别写回错误让它无限重试。
+		slog.Error("on invalid topic", "en", en, "err", err)
+		this.Close(sid, true)
 		return
 	}
 	this.l.Lock()
+	s, ok := this.services[sid]
+	if !ok {
+		// 连接已经断了（service 已被 closeLocked 摘掉），这是 msgWorker 在连接关闭后
+		// drain 出来的残留 On 消息。绝不能再把 sid 写回 topic 索引——否则会留下一个
+		// 永远没人清理的"幽灵监听者"，后续广播到它必然失败。
+		this.l.Unlock()
+		return
+	}
 	var ts *topicSids
 	if tp.IsReg {
 		ts = this.regs[en]
@@ -375,9 +379,7 @@ func (this *server) on(sid uint32, frame *msg.Msg) {
 		}
 	}
 	ts.sids[sid] = struct{}{}
-	if s, ok := this.services[sid]; ok {
-		s.addTopicLocked(ts)
-	}
+	s.addTopicLocked(ts)
 	this.l.Unlock()
 	this.write(sid, frame)
 }
@@ -530,7 +532,7 @@ func (this *server) write(sid uint32, m *msg.Msg) error {
 		return fmt.Errorf("%w,service id:%d not found", ErrServer, sid)
 	}
 	if err := s.Write(m); err != nil {
-		logrus.Error(err)
+		slog.Error("write", "err", err)
 		return err
 	}
 	return nil

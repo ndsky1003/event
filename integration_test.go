@@ -56,6 +56,13 @@ func serviceCount(srv *server) int {
 	return len(srv.services)
 }
 
+// isConnected 测试辅助：客户端当前是否有已握手成功、正在服务的连接。
+func isConnected(c *Client) bool {
+	c.l.Lock()
+	defer c.l.Unlock()
+	return c.conn != nil
+}
+
 // listenerCount 必须持锁读：server.on() 在锁内写 exact / regs
 func listenerCount(srv *server) int {
 	srv.l.Lock()
@@ -76,7 +83,7 @@ func TestEmitOnRoundTrip(t *testing.T) {
 		SetName("roundtrip").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(200*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	got := make(chan string, 8)
 	c.On("itest.echo", func(name string) error {
@@ -108,7 +115,7 @@ func TestHandlerErrorPropagatesToEmitter(t *testing.T) {
 		SetName("errcase").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(200*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	c.On("itest.fail", func(s string) error {
 		return errors.New("handler boom")
@@ -132,7 +139,7 @@ func TestRegexTopic(t *testing.T) {
 		SetName("regex").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(200*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	type hit struct {
 		sub []string
@@ -171,7 +178,7 @@ func TestIdleConnSurvivesHeartbeat(t *testing.T) {
 		SetName("idle").
 		SetHeartInterval(300*time.Millisecond).
 		SetCheckInterval(200*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	got := make(chan struct{}, 8)
 	c.On("itest.idle", func(s string) error { got <- struct{}{}; return nil })
@@ -189,7 +196,7 @@ func TestIdleConnSurvivesHeartbeat(t *testing.T) {
 
 	// 静默 3 秒 = 10 个心跳周期，连接不该断
 	time.Sleep(3 * time.Second)
-	if !c.isConnected() {
+	if !isConnected(c) {
 		t.Fatal("空闲期间连接断了")
 	}
 	if err := c.Emit("itest.idle", "after-idle"); err != nil {
@@ -210,7 +217,7 @@ func TestReconnectAndReregister(t *testing.T) {
 		SetName("reconn").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(100*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	got := make(chan string, 16)
 	c.On("itest.reconn", func(s string) error { got <- s; return nil })
@@ -219,6 +226,15 @@ func TestReconnectAndReregister(t *testing.T) {
 	waitFor(t, 3*time.Second, "topic 注册成功", func() bool {
 		return c.Emit("itest.reconn", "before") == nil
 	})
+	// 消费断线前那条 "before"，避免残留被误判成重连后的送达
+	select {
+	case v := <-got:
+		if v != "before" {
+			t.Fatalf("期望首条是 before，实际 %q", v)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("首条事件没有送达")
+	}
 
 	// 服务端主动掐掉这条连接
 	srv.l.Lock()
@@ -231,18 +247,21 @@ func TestReconnectAndReregister(t *testing.T) {
 		t.Fatalf("服务端关闭连接失败: %v", err)
 	}
 
-	waitFor(t, 5*time.Second, "客户端重连并重新注册", func() bool {
-		if serviceCount(srv) != 1 || !c.isConnected() {
+	// 重连后反复 Emit，直到回调真的被触发（收到 after），证明 topic 已重新注册
+	waitFor(t, 5*time.Second, "重连后 topic 重新注册并送达", func() bool {
+		if serviceCount(srv) != 1 || !isConnected(c) {
 			return false
 		}
-		return c.Emit("itest.reconn", "after") == nil
+		if err := c.Emit("itest.reconn", "after"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "after"
+		default:
+			return false
+		}
 	})
-	select {
-	case v := <-got:
-		t.Logf("重连后收到（可能是重连前的残留）: %q", v)
-	case <-time.After(3 * time.Second):
-		t.Fatal("重连后事件没有送达")
-	}
 }
 
 func TestWrongSecretRejected(t *testing.T) {
@@ -252,7 +271,7 @@ func TestWrongSecretRejected(t *testing.T) {
 		SetName("bad").SetSecret("wrong").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(100*time.Millisecond))
-	defer c.Stop(nil)
+	defer c.Close()
 
 	time.Sleep(600 * time.Millisecond)
 	if n := serviceCount(srv); n != 0 {
@@ -271,14 +290,14 @@ func TestMultipleListenersErrorsAggregated(t *testing.T) {
 	const n = 3
 	c1 := Dial(addr, ClientOptions().SetName("pub").
 		SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
-	defer c1.Stop(nil)
+	defer c1.Close()
 
 	for i := 0; i < n; i++ {
 		// go.mod 是 go 1.20，循环变量是共享的，必须自己捕获
 		idx := i
 		c := Dial(addr, ClientOptions().SetName(fmt.Sprintf("sub%d", idx)).
 			SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
-		defer c.Stop(nil)
+		defer c.Close()
 		c.On("itest.multi", func(s string) error {
 			return fmt.Errorf("boom-%d", idx)
 		})
@@ -313,11 +332,11 @@ func TestDispatchFailureReleasesPending(t *testing.T) {
 	addr, srv := startServer(t, ServerOptions().SetTimeout(timeout).SetHeartInterval(time.Second))
 
 	sub := Dial(addr, ClientOptions().SetName("sub").SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
-	defer sub.Stop(nil)
+	defer sub.Close()
 	sub.On("itest.dead", func() error { return nil })
 
 	pub := Dial(addr, ClientOptions().SetName("pub").SetCheckInterval(200*time.Millisecond))
-	defer pub.Stop(nil)
+	defer pub.Close()
 
 	waitFor(t, 5*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
 
@@ -355,8 +374,8 @@ func TestOnThenEmitIsNotLost(t *testing.T) {
 	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
 
 	pub := Dial(addr, ClientOptions().SetName("pub-order").SetCheckInterval(200*time.Millisecond))
-	defer pub.Stop(nil)
-	waitFor(t, 5*time.Second, "发布者连接", func() bool { return pub.isConnected() })
+	defer pub.Close()
+	waitFor(t, 5*time.Second, "发布者连接", func() bool { return isConnected(pub) })
 
 	for i := 0; i < 20; i++ {
 		en := eventname.T(fmt.Sprintf("itest.order-%d", i))
@@ -367,7 +386,7 @@ func TestOnThenEmitIsNotLost(t *testing.T) {
 			SetCheckInterval(10*time.Second))
 		// Dial 是异步的，先等连接起来；否则 On 只会把 topic 记在本地，
 		// 要等 connect 成功才上报，测的就不是顺序问题了
-		waitFor(t, 5*time.Second, "监听者连接", func() bool { return sub.isConnected() })
+		waitFor(t, 5*time.Second, "监听者连接", func() bool { return isConnected(sub) })
 		sub.On(en, func(s string) error {
 			got <- s
 			return nil
@@ -409,9 +428,9 @@ func TestListenerDeathReleasesPending(t *testing.T) {
 	})
 
 	pub := Dial(addr, ClientOptions().SetName("pub").SetCheckInterval(200*time.Millisecond))
-	defer pub.Stop(nil)
+	defer pub.Close()
 
-	waitFor(t, 5*time.Second, "发布者连接", func() bool { return pub.isConnected() })
+	waitFor(t, 5*time.Second, "发布者连接", func() bool { return isConnected(pub) })
 	waitFor(t, 10*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
 
 	call := pub.EmitAsync("itest.slow")
@@ -422,7 +441,7 @@ func TestListenerDeathReleasesPending(t *testing.T) {
 	}
 
 	// 监听者带着这个未完成的请求断线
-	sub.Stop(nil)
+	sub.Close()
 
 	select {
 	case c := <-call.Done:
@@ -465,7 +484,7 @@ func TestClientCloseStopsReconnect(t *testing.T) {
 	if n := serviceCount(srv); n != 0 {
 		t.Fatalf("Close 之后又重连了，服务端连接数=%d", n)
 	}
-	if c.isConnected() {
+	if isConnected(c) {
 		t.Fatal("Close 之后 isConnected 仍为 true")
 	}
 	// 幂等
@@ -544,7 +563,7 @@ func TestListenerDeathReleasesManyPending(t *testing.T) {
 
 	pub := Dial(addr, ClientOptions().SetName("pub-many").SetCheckInterval(200*time.Millisecond))
 	defer pub.Close()
-	waitFor(t, 10*time.Second, "发布者连接", func() bool { return pub.isConnected() })
+	waitFor(t, 10*time.Second, "发布者连接", func() bool { return isConnected(pub) })
 	waitFor(t, 10*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
 
 	calls := make([]*Call, 0, n)
@@ -666,7 +685,7 @@ func TestServerShutdown(t *testing.T) {
 
 	// 客户端必须感知到断连，本地挂着的 Call 也会被结算
 	waitFor(t, 10*time.Second, "客户端检测到断连",
-		func() bool { return !pub.isConnected() && !sub.isConnected() })
+		func() bool { return !isConnected(pub) && !isConnected(sub) })
 
 	// 端口必须能重新绑定，证明 listener 真的关了
 	l2, err := net.Listen("tcp", addr)

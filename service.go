@@ -2,26 +2,23 @@ package event
 
 import (
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/ndsky1003/event/v2/coder"
 	"github.com/ndsky1003/event/v2/msg"
 	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/sirupsen/logrus"
 )
 
 // service 服务端一条客户端连接的封装。
 // 传输（帧、攒批 writev、心跳、看门狗、关闭）全部交给 Conn，
 // 这里只负责 msg.Msg 的编解码与分发。
+// 消息框架统一用 coder.Msgp，事件参数仍由 msg.Msg.Coder 字段声明，两者互不影响。
 type service struct {
 	id     uint32
 	name   string
 	server *server
 	conn   *Conn
-	// envCoder 这条连接的消息框架编码方式，由握手第一帧的标记字节决定，回包沿用。
-	// 只在 handshake 里写一次，之后只读——service 是握手成功后才发布到
-	// server.services 的，发布走的是 server.l，读侧天然看得到。
-	envCoder coder.T
 
 	// tps 这条连接注册过的 topic 条目。连接断开时只摘这几条，
 	// 不必遍历服务端全部的 topic 索引。由 server.l 保护。
@@ -40,24 +37,23 @@ func (this *service) addTopicLocked(ts *topicSids) {
 
 func newService(server *server, id uint32, conn *Conn) *service {
 	return &service{
-		id:       id,
-		name:     fmt.Sprintf("sid-%d", id),
-		server:   server,
-		conn:     conn,
-		envCoder: coder.Msgp,
+		id:     id,
+		name:   fmt.Sprintf("sid-%d", id),
+		server: server,
+		conn:   conn,
 	}
 }
 
 // handshake 鉴权握手。必须在 conn.Serve() 之前调用：
 // 那时 readPump/writePump 都还没起，只有当前 goroutine 碰 socket，
-// 所以可以用 writeSync/readSync 这种同步读写。
+// 所以可以用 WriteToConn / Read 这种同步读写。
 func (this *service) handshake() error {
 	body, err := this.conn.Read(5 * time.Second)
 	if err != nil {
 		return fmt.Errorf("%w,read verify req:%w", ErrServer, err)
 	}
 	var req msg.MsgVerifyReq
-	if this.envCoder, err = decodeEnvelope(body, &req); err != nil {
+	if _, err = coder.Decode(coder.Msgp, body, &req); err != nil {
 		return fmt.Errorf("%w,decode verify req:%w", ErrServer, err)
 	}
 
@@ -74,17 +70,17 @@ func (this *service) handshake() error {
 }
 
 func (this *service) writeHandshakeRes(res *msg.MsgVerifyRes) error {
-	body, err := encodeEnvelope(this.envCoder, res)
+	body, err := coder.Encode(coder.Msgp, nil, res)
 	if err != nil {
 		return fmt.Errorf("%w,encode verify res:%w", ErrServer, err)
 	}
-	if err = this.conn.Write(5*time.Second, body); err != nil {
+	if err = this.conn.WriteToConn(5*time.Second, body); err != nil {
 		return fmt.Errorf("%w,write verify res:%w", ErrServer, err)
 	}
 	return nil
 }
 
-// HandleMsg 实现 Handler，由 readPump 同步调用。
+// HandleMsg 实现 Handler，由 readPump 入队、msgWorker 串行调用。
 // PING/PONG 已经在传输层消化掉了，不会走到这里。
 //
 // 这里**必须同步**调用 server.handle，不能丢给 goroutine：
@@ -95,14 +91,14 @@ func (this *service) writeHandshakeRes(res *msg.MsgVerifyRes) error {
 // 真正的耗时（业务回调）在客户端侧由 func_call 异步执行，不在这条路径上。
 func (this *service) HandleMsg(body []byte) error {
 	var frame msg.Msg
-	if _, err := decodeEnvelope(body, &frame); err != nil {
+	if _, err := coder.Decode(coder.Msgp, body, &frame); err != nil {
 		return fmt.Errorf("%w,decode body err:%w", ErrServer, err)
 	}
 	switch frame.T {
 	case msgtype.On, msgtype.Req, msgtype.ReqRandOne, msgtype.Res, msgtype.ResRandOne:
 		this.server.handle(this.id, this.name, &frame)
 	default:
-		logrus.Infof("%v,invalid msg:%+v", ErrServer, frame)
+		slog.Info("invalid msg", "msg", frame)
 	}
 	return nil
 }
@@ -110,11 +106,11 @@ func (this *service) HandleMsg(body []byte) error {
 // Write 编码后投递给 Conn 的发送队列。
 // 不再自己维护 sendChan：Conn 里已经有了，而且会攒批 writev。
 func (this *service) Write(m *msg.Msg) error {
-	body, err := encodeEnvelope(this.envCoder, m)
+	body, err := coder.Encode(coder.Msgp, nil, m)
 	if err != nil {
 		return fmt.Errorf("%w,encode msg err:%w", ErrServer, err)
 	}
-	if err = this.conn.write(flag_msg, body); err != nil {
+	if err = this.conn.Write(body); err != nil {
 		return fmt.Errorf("%w,conn write err:%w", ErrServer, err)
 	}
 	return nil

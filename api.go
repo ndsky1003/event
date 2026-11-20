@@ -107,8 +107,8 @@ func (this *Client) On(t eventname.T, Func any) error {
 		// 那时 topic 还没注册，事件直接变成"无人监听"被丢掉，而且不报错。
 		// 服务端现在也是同步处理单条连接的消息（service.HandleMsg），
 		// 两端一起才真正保证顺序。
-		// 连接还没起来时 regist_topic 会立刻返回，connect 成功后再补注册，
-		// 所以这里不会阻塞在"没连接"上。
+		// 连接还没起来时 regist_topic 会隔 2s 重试直到成功，所以这里会阻塞
+		// 到连上为止，保证 On 返回时 topic 已在服务端就位。
 		this.regist_topic()
 	}
 	return nil

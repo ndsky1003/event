@@ -1,6 +1,6 @@
 # event
 
-基于观察者模式的事件总线库：通过 TCP 在多个进程间做事件订阅/发布（消息框架与事件参数都走 msgpack 编码，默认 `coder.Msgp`），典型场景是"多服务器配置文件检查"。
+基于观察者模式的事件总线库：通过 TCP 在多个进程间做事件订阅/发布，典型场景是「多服务器配置文件检查」。消息框架（`Msg`）统一走 `coder.Msgp`，事件参数由 `Msg.Coder` 声明（默认 `coder.Msgp`，即 msgpack）。
 
 ## 安装
 
@@ -34,7 +34,7 @@ client.On("db_op", func(a int, b string) error {
 })
 
 // 正则模式：topic 前后带 /，回调第一个参数固定为 []string（正则子匹配结果）
-client.On("/db_[a-z]+/", func(match []string, a int, b string, c *Person) error {
+client.On("/db_[a-z]+/", func(match []string, a int, b string) error {
     // do something
     return nil
 })
@@ -67,6 +67,7 @@ if err := client.Emit("db_op", 1, "hello", &Person{Name: "飞毛腿1号", Age: 1
 | 方法 | 说明 | 默认 |
 | --- | --- | --- |
 | `SetTimeout(time.Duration)` | 等待所有监听者响应的超时 | `10s` |
+| `SetHeartInterval(time.Duration)` | 心跳间隔（传输层看门狗周期） | `20s` |
 | `SetSecret(string)` | 连接握手密钥，客户端需一致 | 空 |
 | `SetIsWrapError(bool)` | 是否包装错误来源 | `true` |
 
@@ -88,13 +89,13 @@ if err := srv.Shutdown(); err != nil {
 
 ### 客户端
 
-- `event.Dial(url string, opts ...*ClientOption) *Client` — 创建客户端，内置自动重连与心跳。`Dial` 是异步的，返回时连接可能还没建立。
-- `On(t eventname.T, Func any)` — 注册监听（无返回值）。连接已就绪时**同步**完成注册，所以 `On` 之后可以立刻 `Emit`。
+- `event.Dial(url string, opts ...*ClientOption) *Client` — 创建客户端，内置自动重连（拨号/握手失败时指数退避）与心跳。`Dial` 是异步的，返回时连接可能还没建立。
+- `On(t eventname.T, Func any) error` — 注册监听。连接未就绪时会同步阻塞到注册成功（保证 `On` 之后紧跟的 `Emit` 不丢）；`Close` 会打断这个阻塞。
 - `Emit(en eventname.T, args ...any) error` — 发布，等所有监听者返回。
 - `EmitAsync(en eventname.T, args ...any) *Call` — 异步发布。
 - `EmitSomeOne(en eventname.T, args ...any) error` — 发布，只等最快的响应。
 - `EmitSomeOneAsnyc(en eventname.T, args ...any) *Call` — 异步版。
-- `Stop(err error)` — 断开当前连接，**会自动重连**；`err` 会被结算到所有未完成的 `Call` 上。
+- `Builder() *builder` — 链式构建一次发送（可自定义消息类型/事件名/发送选项/参数），高级用法。
 - `Close() error` — 彻底关闭：断开当前连接并停止重连，幂等。不用 `Close` 的话，客户端的重连 goroutine 与连接会一直存在。
 
 客户端选项 `event.ClientOptions()`：
@@ -103,9 +104,10 @@ if err := srv.Shutdown(); err != nil {
 | --- | --- | --- |
 | `SetName(string)` | 客户端名称 | 空 |
 | `SetSecret(string)` | 握手密钥 | 空 |
-| `SetCheckInterval(time.Duration)` | 断线重连间隔 | `2s` |
-| `SetHeartInterval(time.Duration)` | 心跳间隔 | `20s` |
+| `SetCheckInterval(time.Duration)` | 断线重连间隔（指数退避的起点） | `2s` |
+| `SetHeartInterval(time.Duration)` | 心跳间隔 | `10s` |
 | `SetIsWrapError(bool)` | 是否包装错误来源 | `true` |
+| `SetCoderType(coder.T)` | 事件参数编码方式（`Raw`/`JSON`/`Msgp`） | `Msgp` |
 
 ### 异步调用
 
@@ -166,11 +168,13 @@ QPS = 在途并发数 / 单条往返延迟
 
 ## 错误处理
 
-- 错误默认被包装以标明来源，可用 `errors.Is` 配合哨兵错误判断，如 `ErrClient`、`ErrServer`、`ErrNoConnect`、`ErrClientEncode`、`ErrClientDecode`（定义在 `err.go`）。
+- 错误默认被包装以标明来源，可用 `errors.Is` 配合哨兵错误判断，如 `ErrClient`、`ErrServer`、`ErrClientEncode`、`ErrClientDecode`、`ErrConnClosed`（定义在 `err.go`）。
 - 通过 `SetIsWrapError(false)` 可关闭包装。
 
 ## 注意事项
 
+- **断线自动重连**：客户端 `Dial` 后会自动重连；拨号/握手失败时按 `SetCheckInterval` 指数退避（默认 2s 起步、翻倍到 32s 封顶），连接成功建立过则退避归零。
+- **`On` 会阻塞到注册成功**：连接没起来时 `On` 同步阻塞（隔 2s 重试），保证 `On` 返回后紧跟的 `Emit` 不丢；`Close` 会打断阻塞让 `On` 返回。
 - 事件参数默认经 msgpack 反射编码，具体类型（结构体/切片/基本类型等）开箱即用，无需注册。但**接口（`interface{}`）参数会丢失具体类型**（如整数 `42` 可能解成 `int8`），请使用具体类型参数。
 - 可选 msgp 快路径：对参数类型跑 `msgp` 生成 `*_gen.go` 后，**值类型参数**（`func(o Outer) error`）自动走 msgp（无反射，更快）；**指针类型参数**（`func(o *Outer) error`）仍走 msgpack（为支持 `nil`）。两者 struct 默认都编码成 map 格式，互通。
 - 整数解码**不校验溢出**：`Emit` 传的整数与回调入参位宽不一致会静默截断（如 `int64(300)` 解成 `int8` 得 `44`，不报错），请保证 `Emit` 传参与回调签名类型严格一致。
@@ -179,4 +183,3 @@ QPS = 在途并发数 / 单条往返延迟
 - **顺序**：同一条连接上的消息按到达顺序处理，所以 `On` 之后立刻 `Emit` 不会丢事件。但**跨连接之间没有顺序保证**——发布者与监听者是两条连接时，先发的 `On` 注册帧与后发的 `Emit` 之间仍有一个网络往返的窗口，稳妥做法是等注册完成（`On` 在连接已就绪时是同步的）或重试。
 - **投递语义是 at-most-once**：`Emit` 返回 `nil` 只代表所有监听者都回了包。监听者收下请求后断线，发布者会拿到 `connection lost before response` 错误，但事件是否已被处理无法确定，库不会自动重投。
 - 监听者断线时，它欠着的请求会被**立即**结算（错误里带 `connection lost before response`），不会让发布者干等 `SetTimeout`。
-- 导入本库会触发 `logrus.SetReportCaller(true)`（`client.go` 的 `init()`），有全局副作用。
