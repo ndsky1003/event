@@ -13,6 +13,7 @@ type ClientOption struct {
 	is_wrap_error  *bool
 	coder_type     *coder.T //事件参数的编码方式,默认为 Msgp
 	connOption
+	timeout *time.Duration //等待所有监听者响应的超时。单位就是 time.Duration 本身,不要再乘 time.Second
 }
 
 func ClientOptions() *ClientOption {
@@ -70,6 +71,15 @@ func (this *ClientOption) SetCoderType(t coder.T) *ClientOption {
 	return this
 }
 
+// SetTimeout 等待所有监听者响应的超时。t 是完整的 time.Duration，例如 10*time.Second，不是秒数。
+func (this *ClientOption) SetTimeout(t time.Duration) *ClientOption {
+	if this == nil {
+		return this
+	}
+	this.timeout = &t
+	return this
+}
+
 func (this *ClientOption) merges(opts ...*ClientOption) *ClientOption {
 	for _, opt := range opts {
 		this.merge(opt)
@@ -99,6 +109,9 @@ func (this *ClientOption) merge(opt *ClientOption) {
 	}
 	if opt.coder_type != nil {
 		this.coder_type = opt.coder_type
+	}
+	if opt.timeout != nil {
+		this.timeout = opt.timeout
 	}
 }
 
@@ -179,4 +192,50 @@ type SendOption struct {
 
 func SendOptions() *SendOption {
 	return &SendOption{}
+}
+
+// SetTimeout 设置本次发送的等待超时。t 是完整的 time.Duration，例如 10*time.Second，不是秒数。
+func (this *SendOption) SetTimeout(t time.Duration) *SendOption {
+	if this == nil {
+		return this
+	}
+	this.timeout = &t
+	return this
+}
+
+// SetCoderType 设置本次发送的事件参数编码方式（Raw/JSON/Msgp），默认跟随客户端。
+func (this *SendOption) SetCoderType(t coder.T) *SendOption {
+	if this == nil {
+		return this
+	}
+	this.ct = &t
+	return this
+}
+
+func (this *SendOption) merges(opts ...*SendOption) *SendOption {
+	for _, opt := range opts {
+		this.merge(opt)
+	}
+	return this
+}
+
+func (this *SendOption) merge(opt *SendOption) {
+	if opt == nil {
+		return
+	}
+	if opt.timeout != nil {
+		this.timeout = opt.timeout
+	}
+	if opt.ct != nil {
+		this.ct = opt.ct
+	}
+}
+
+func (this *SendOption) mergeClientOption(opt *ClientOption) {
+	if this.timeout == nil && opt.timeout != nil {
+		this.timeout = opt.timeout
+	}
+	if this.ct == nil && opt.coder_type != nil {
+		this.ct = opt.coder_type
+	}
 }

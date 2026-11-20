@@ -352,11 +352,11 @@ func (this *Client) regist_topic_lock() error {
 	return nil
 }
 
-func (this *Client) emit_async(t msgtype.T, en eventname.T, ct coder.T, args ...any) (call *Call) {
+func (this *Client) emit_async(t msgtype.T, en eventname.T, opt SendOption, args ...any) (call *Call) {
 	m := &msg.Msg{
 		T:         t,
 		EventName: en,
-		Coder:     ct,
+		Coder:     *opt.ct,
 	}
 	call = NewCall(m)
 	if m.EventName == "" {

@@ -23,7 +23,8 @@ func (this *builder) BuildEventName(en eventname.T) *builder {
 	return this
 }
 
-func (this *builder) BuildCoder(opts ...SendOption) *builder {
+func (this *builder) BuildSendOption(opts ...*SendOption) *builder {
+	this.opt.merges(opts...)
 	return this
 }
 
@@ -33,6 +34,7 @@ func (this *builder) BuildArgs(args ...any) *builder {
 }
 
 func (this *builder) Send() (call *Call) {
-	call = this.client.emit_async(this.t, this.en, *this.ct, this.args...)
+	this.opt.mergeClientOption(this.client.opt)
+	call = this.client.emit_async(this.t, this.en, this.opt, this.args...)
 	return
 }
