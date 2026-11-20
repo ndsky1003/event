@@ -8,6 +8,7 @@ import (
 	"math"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -100,10 +101,18 @@ func (this *Client) keepAlive() {
 	}
 }
 
+// dial 按地址前缀拨号：unix:// 走 Unix domain socket（同机），其余走 TCP。
+func dial(addr string) (net.Conn, error) {
+	if path, ok := strings.CutPrefix(addr, "unix://"); ok {
+		return net.Dial("unix", path)
+	}
+	return net.Dial("tcp", addr)
+}
+
 // connect 建立连接、完成握手，然后阻塞到连接结束，返回连接与终止原因。
 // 握手失败会关闭连接并置 conn 为 nil，避免泄漏尚未 Serve 的连接。
 func (this *Client) connect(ctx context.Context) (conn *Conn, err error) {
-	raw, err := net.Dial("tcp", this.url)
+	raw, err := dial(this.url)
 	if err != nil {
 		return nil, fmt.Errorf("%w dial err: %w", ErrClient, err)
 	}

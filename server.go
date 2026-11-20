@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -111,7 +113,7 @@ func (this *ServerOption) connOptions() *connOption {
 // addrs ["192.168.0.1:8080","192.168.0.2:8080"]
 // 最后一个地址阻塞（保持原有语义），前面的各起一个 goroutine。
 // 想让阻塞的那个返回，就调 Shutdown。
-func (this *server) Listens(addrs []string) {
+func (this *server) Listens(addrs ...string) {
 	for i := len(addrs) - 1; i >= 0; i-- {
 		addr := addrs[i]
 		if i != 0 {
@@ -127,6 +129,24 @@ func (this *server) Listen(url string) {
 	this.listen(url)
 }
 
+// listenAddr 按地址前缀监听：unix:// 走 Unix domain socket（同机），其余走 TCP。
+// Close 时自动 unlink socket 文件，避免重启后 bind: address already in use。
+func listenAddr(addr string) (net.Listener, error) {
+	if path, ok := strings.CutPrefix(addr, "unix://"); ok {
+		// 清理上次进程崩溃残留的 socket 文件
+		_ = os.Remove(path)
+		l, err := net.Listen("unix", path)
+		if err != nil {
+			return nil, err
+		}
+		if ul, ok := l.(*net.UnixListener); ok {
+			ul.SetUnlinkOnClose(true)
+		}
+		return l, nil
+	}
+	return net.Listen("tcp", addr)
+}
+
 func (this *server) listen(url string) {
 	if this == nil {
 		panic("server is nil")
@@ -138,7 +158,7 @@ func (this *server) listen(url string) {
 		slog.Error("server already shutdown, skip listen", "url", url)
 		return
 	}
-	listen, err := net.Listen("tcp", url)
+	listen, err := listenAddr(url)
 	if err != nil {
 		panic(err)
 	}

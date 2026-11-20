@@ -31,6 +31,25 @@ func (this *Client) EmitSomeOneAsnyc(en eventname.T, args ...any) *Call {
 	return this.emit_async(msgtype.ReqRandOne, en, *opt, args...)
 }
 
+// EmitBatch 批量发布：并发发送同一事件的多个参数组合，等所有监听者都响应后返回。
+// 语义等同"并发调 N 次 EmitAsync 再等全部"，区别是这些消息会一起进发送队列，
+// writePump 能攒批（writev 次数少、QPS 高）。返回与 argsList 一一对应的错误。
+func (this *Client) EmitBatch(en eventname.T, argsList ...[]any) []error {
+	if len(argsList) == 0 {
+		return nil
+	}
+	calls := make([]*Call, 0, len(argsList))
+	for _, args := range argsList {
+		calls = append(calls, this.EmitAsync(en, args...))
+	}
+	errs := make([]error, len(calls))
+	for i, call := range calls {
+		<-call.Done
+		errs[i] = call.Err
+	}
+	return errs
+}
+
 func (this *Client) Builder() *builder {
 	return &builder{client: this}
 }

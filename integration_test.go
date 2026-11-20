@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -262,6 +264,167 @@ func TestReconnectAndReregister(t *testing.T) {
 			return false
 		}
 	})
+}
+
+func TestUnixSocket(t *testing.T) {
+	sock := filepath.Join(t.TempDir(), "event.sock")
+	addr := "unix://" + sock
+	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go srv.Listen(addr)
+	t.Cleanup(func() {
+		if err := srv.Shutdown(); err != nil {
+			t.Logf("Shutdown: %v", err)
+		}
+	})
+
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	got := make(chan string, 4)
+	if err := c.On("uds.test", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor(t, 5*time.Second, "UDS 事件送达", func() bool {
+		if err := c.Emit("uds.test", "hello"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "hello"
+		default:
+			return false
+		}
+	})
+
+	// 关闭后 socket 文件应被自动 unlink
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("Shutdown 后 socket 文件应被删除，stat err=%v", err)
+	}
+}
+
+// measureEmitRoundTrip 测「客户端同时是发布者和监听者」场景下单次 Emit 的
+// 平均往返耗时（4 跳：进 → 散 → 回 → 聚合回）。
+func measureEmitRoundTrip(t *testing.T, addr string) time.Duration {
+	t.Helper()
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	if err := c.On("bench.topic", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	// 预热：让连接稳定、缓冲热起来
+	for i := 0; i < 200; i++ {
+		if err := c.Emit("bench.topic"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const n = 5000
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if err := c.Emit("bench.topic"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return time.Since(start) / n
+}
+
+func TestCompareTCPvsUDS(t *testing.T) {
+	tcpAddr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
+
+	udsAddr := "unix://" + filepath.Join(t.TempDir(), "event.sock")
+	udsSrv := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go udsSrv.Listen(udsAddr)
+	t.Cleanup(func() {
+		if err := udsSrv.Shutdown(); err != nil {
+			t.Logf("Shutdown: %v", err)
+		}
+	})
+
+	tcpLatency := measureEmitRoundTrip(t, tcpAddr)
+	udsLatency := measureEmitRoundTrip(t, udsAddr)
+
+	t.Logf("TCP 单次 Emit 往返: %v", tcpLatency)
+	t.Logf("UDS 单次 Emit 往返: %v", udsLatency)
+	if tcpLatency > 0 && udsLatency > 0 {
+		t.Logf("UDS 比 TCP 快 %.2fx（延迟降 %.0f%%）",
+			float64(tcpLatency)/float64(udsLatency),
+			(1-float64(udsLatency)/float64(tcpLatency))*100)
+	}
+}
+
+func TestEmitBatch(t *testing.T) {
+	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	got := make(chan string, 256)
+	if err := c.On("batch.test", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 100
+	argsList := make([][]any, n)
+	for i := range argsList {
+		argsList[i] = []any{fmt.Sprintf("msg-%d", i)}
+	}
+	errs := c.EmitBatch("batch.test", argsList...)
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("第 %d 条 Emit 失败: %v", i, err)
+		}
+	}
+	for i := 0; i < n; i++ {
+		select {
+		case <-got:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("只收到 %d 个回调，期望 %d", i, n)
+		}
+	}
+}
+
+func TestEmitBatchFaster(t *testing.T) {
+	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	if err := c.On("batch.faster", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	// 预热
+	for i := 0; i < 100; i++ {
+		if err := c.Emit("batch.faster"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// batch 上限受 msgChan 容量（512）约束，太大触发背压（msgChan is full）会断连
+	const n = 200
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		if err := c.Emit("batch.faster"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seqLatency := time.Since(start) / n
+
+	argsList := make([][]any, n)
+	start = time.Now()
+	if errs := c.EmitBatch("batch.faster", argsList...); len(errs) > 0 {
+		for _, err := range errs {
+			if err != nil {
+				t.Fatalf("EmitBatch 失败: %v", err)
+			}
+		}
+	}
+	batchLatency := time.Since(start) / n
+
+	t.Logf("逐个同步 Emit: %v/条", seqLatency)
+	t.Logf("EmitBatch: %v/条", batchLatency)
+	t.Logf("批量提速 %.2fx", float64(seqLatency)/float64(batchLatency))
 }
 
 func TestWrongSecretRejected(t *testing.T) {
