@@ -306,6 +306,116 @@ func TestUnixSocket(t *testing.T) {
 	}
 }
 
+func TestUnixSocketReconnectAfterServerRestart(t *testing.T) {
+	// Unix socket 路径有长度上限，测试名太长会让 t.TempDir() 的路径超限，这里用 /tmp 短路径
+	sock := fmt.Sprintf("/tmp/event-uds-%d.sock", time.Now().UnixNano())
+	t.Cleanup(func() { os.Remove(sock) })
+	addr := "unix://" + sock
+
+	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go srv.Listen(addr)
+
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	got := make(chan string, 16)
+	if err := c.On("uds.reconn", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 3*time.Second, "首轮连接 + 注册", func() bool {
+		if err := c.Emit("uds.reconn", "before"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "before"
+		default:
+			return false
+		}
+	})
+
+	// 关掉服务端：socket 文件被 unlink，客户端连接断开
+	if err := srv.Shutdown(); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+	if _, err := os.Stat(sock); !os.IsNotExist(err) {
+		t.Fatalf("Shutdown 后 socket 文件应被删除")
+	}
+
+	// 重启服务端（同一路径）
+	srv2 := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go srv2.Listen(addr)
+	t.Cleanup(func() {
+		if err := srv2.Shutdown(); err != nil {
+			t.Logf("Shutdown: %v", err)
+		}
+	})
+
+	// 客户端应自动重连 + 重新注册，事件恢复送达
+	waitFor(t, 10*time.Second, "重启后重连并重新注册", func() bool {
+		if err := c.Emit("uds.reconn", "after"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "after"
+		default:
+			return false
+		}
+	})
+}
+
+func TestUnixSocketClientBeforeServer(t *testing.T) {
+	sock := fmt.Sprintf("/tmp/event-uds-%d.sock", time.Now().UnixNano())
+	t.Cleanup(func() { os.Remove(sock) })
+	addr := "unix://" + sock
+
+	// 客户端先启动：socket 文件还不存在，Dial 是异步的，On 会阻塞在注册重试上
+	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer c.Close()
+
+	onDone := make(chan error, 1)
+	got := make(chan string, 4)
+	go func() {
+		onDone <- c.On("uds.cbs", func(s string) error { got <- s; return nil })
+	}()
+
+	// 让客户端先失败几轮（此时服务端还没起）
+	time.Sleep(300 * time.Millisecond)
+
+	// 服务端后启动
+	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go srv.Listen(addr)
+	t.Cleanup(func() {
+		if err := srv.Shutdown(); err != nil {
+			t.Logf("Shutdown: %v", err)
+		}
+	})
+
+	// On 应该在服务端启动后（重连 + 注册成功）返回
+	select {
+	case err := <-onDone:
+		if err != nil {
+			t.Fatalf("On 失败: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("On 没有在服务端启动后返回")
+	}
+
+	// 事件应该送达
+	waitFor(t, 5*time.Second, "事件送达", func() bool {
+		if err := c.Emit("uds.cbs", "hello"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "hello"
+		default:
+			return false
+		}
+	})
+}
+
 // measureEmitRoundTrip 测「客户端同时是发布者和监听者」场景下单次 Emit 的
 // 平均往返耗时（4 跳：进 → 散 → 回 → 聚合回）。
 func measureEmitRoundTrip(t *testing.T, addr string) time.Duration {
