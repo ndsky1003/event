@@ -19,12 +19,12 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-var bodyPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 1024)
-		return b
-	},
-}
+// var bodyPool = sync.Pool{
+// 	New: func() any {
+// 		b := make([]byte, 0, 1024)
+// 		return b
+// 	},
+// }
 
 // 锁顺序固定为 rwl -> l。任何持 l 的代码路径都不得再去拿 rwl，
 // 否则会和 On / regist_topic_lock / Stop 交叉死锁（原代码 FIXME 承认的那个问题）。
@@ -331,13 +331,15 @@ func (this *Client) regist_topic() {
 
 // regist_topic_lock 锁顺序 rwl -> l（emit → send 会拿 l）
 func (this *Client) regist_topic_lock() error {
+	opt := SendOptions()
+	opt.mergeClientOption(this.opt)
 	var errs []error
 	this.rwl.Lock()
 	for i := range this.topics {
 		tp := this.topics[i].tp
 		if !tp.IsRegistSuccess {
-			if err := this.emit(msgtype.On, tp.GetEventName()); err != nil {
-				err := fmt.Errorf("%w, emit_on:[%v] err:%w", ErrClient, tp.GetEventName(), err)
+			if call := <-this.emit_async(msgtype.On, tp.GetEventName(), *opt).Done; call.Err != nil {
+				err := fmt.Errorf("%w, emit_on:[%v] err:%w", ErrClient, tp.GetEventName(), call.Err)
 				slog.Error("client.go", "err", err)
 				errs = append(errs, err)
 			} else {
@@ -360,7 +362,7 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, opt SendOption, args
 	}
 	call = NewCall(m)
 	if m.EventName == "" {
-		call.Err = fmt.Errorf("%w,%v", ErrServer, "event name empty")
+		call.Err = fmt.Errorf("%w,%v", ErrClient, "event name empty")
 		call.done()
 		return
 	}
@@ -373,27 +375,21 @@ func (this *Client) emit_async(t msgtype.T, en eventname.T, opt SendOption, args
 		return
 	}
 	m.BodyCount = int8(len(args))
+	m.Bytes = nil
 	if len(args) > 0 {
-		body := bodyPool.Get().([]byte)[:0]
 		var err error
 		for _, arg := range args {
-			if body, err = coder.Encode(m.Coder, body, arg); err != nil {
+			if m.Bytes, err = coder.Encode(m.Coder, m.Bytes, arg); err != nil {
 				err = fmt.Errorf("%w %w current err:%w", ErrClient, ErrClientEncode, err)
 				break
 			}
 		}
 		if err != nil {
-			// coder.Encode 失败时返回 nil，别把 nil 塞回池子污染后面的 Get
-			if body != nil {
-				bodyPool.Put(body[:0])
-			}
+			m.Bytes = nil
 			call.Err = err
 			call.done()
 			return
 		}
-		m.Bytes = make([]byte, len(body))
-		copy(m.Bytes, body)
-		bodyPool.Put(body[:0])
 	}
 	this.send(call)
 	return

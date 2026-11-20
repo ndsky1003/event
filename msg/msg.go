@@ -34,7 +34,7 @@ type Msg struct {
 	Name      string      `msgpack:"n"`
 	BodyCount int8        `msgpack:"bc"` // 超过这个数就是自讨苦吃
 	Coder     coder.T     `msgpack:"c"`  //事件参数的编码方式（Raw/JSON/Msgp）
-	Bytes     []byte      `msgpack:"b"`
+	Bytes     []byte      `msgpack:"b,allownil"`
 	Err       string      `msgpack:"e"` // error
 }
 

@@ -15,7 +15,9 @@ func (this *Client) Emit(en eventname.T, args ...any) error {
 }
 
 func (this *Client) EmitAsync(en eventname.T, args ...any) (call *Call) {
-	return this.emit_async(msgtype.Req, en, *this.opt.coder_type, args...)
+	opt := SendOptions()
+	opt.mergeClientOption(this.opt)
+	return this.emit_async(msgtype.Req, en, *opt, args...)
 }
 
 func (this *Client) EmitSomeOne(en eventname.T, args ...any) error {
@@ -24,7 +26,9 @@ func (this *Client) EmitSomeOne(en eventname.T, args ...any) error {
 }
 
 func (this *Client) EmitSomeOneAsnyc(en eventname.T, args ...any) *Call {
-	return this.emit_async(msgtype.ReqRandOne, en, *this.opt.coder_type, args...)
+	opt := SendOptions()
+	opt.mergeClientOption(this.opt)
+	return this.emit_async(msgtype.ReqRandOne, en, *opt, args...)
 }
 
 func (this *Client) Builder() *builder {
