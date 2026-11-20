@@ -3,7 +3,7 @@ package event
 import (
 	"reflect"
 
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/topic"
 )
 
 type method struct {

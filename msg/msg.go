@@ -5,9 +5,9 @@ package msg
 import (
 	"fmt"
 
-	"github.com/ndsky1003/event/v2/coder"
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msgtype"
+	"github.com/ndsky1003/event/v3/coder"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msgtype"
 )
 
 // 下面这些 msgpack tag 是线上字段名，不是给反射库看的装饰：

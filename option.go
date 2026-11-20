@@ -3,7 +3,7 @@ package event
 import (
 	"time"
 
-	"github.com/ndsky1003/event/v2/coder"
+	"github.com/ndsky1003/event/v3/coder"
 )
 
 type ClientOption struct {

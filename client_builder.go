@@ -1,8 +1,8 @@
 package event
 
 import (
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msgtype"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msgtype"
 )
 
 type builder struct {

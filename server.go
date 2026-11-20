@@ -13,10 +13,10 @@ import (
 	"time"
 
 	"github.com/antlabs/timer"
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 )
 
 // topicSids 一个 topic 条目加上它的监听者集合。

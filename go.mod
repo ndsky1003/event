@@ -1,6 +1,6 @@
-module github.com/ndsky1003/event/v2
+module github.com/ndsky1003/event/v3
 
-go 1.24
+go 1.27
 
 require (
 	github.com/antlabs/timer v0.1.4

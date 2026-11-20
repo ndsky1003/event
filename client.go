@@ -13,10 +13,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ndsky1003/event/v2/coder"
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
+	"github.com/ndsky1003/event/v3/coder"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
 )
 
 // 锁顺序固定为 rwl -> l：持 l 的代码路径不得再去拿 rwl，

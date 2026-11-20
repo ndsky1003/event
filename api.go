@@ -4,9 +4,9 @@ import (
 	"errors"
 	"reflect"
 
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msgtype"
-	"github.com/ndsky1003/event/v2/topic"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msgtype"
+	"github.com/ndsky1003/event/v3/topic"
 )
 
 func (this *Client) Emit(en eventname.T, args ...any) error {

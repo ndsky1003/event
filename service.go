@@ -5,9 +5,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/ndsky1003/event/v2/coder"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
+	"github.com/ndsky1003/event/v3/coder"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
 )
 
 // service 服务端一条客户端连接的封装。

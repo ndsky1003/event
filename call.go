@@ -1,6 +1,6 @@
 package event
 
-import "github.com/ndsky1003/event/v2/msg"
+import "github.com/ndsky1003/event/v3/msg"
 
 type Call struct {
 	Msg  *msg.Msg

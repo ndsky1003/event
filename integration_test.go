@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ndsky1003/event/v2/eventname"
-	"github.com/ndsky1003/event/v2/msg"
-	"github.com/ndsky1003/event/v2/msgtype"
+	"github.com/ndsky1003/event/v3/eventname"
+	"github.com/ndsky1003/event/v3/msg"
+	"github.com/ndsky1003/event/v3/msgtype"
 )
 
 // 端到端集成测试：走真实的 TCP + 新帧格式 + coder（默认 msgpack）。
