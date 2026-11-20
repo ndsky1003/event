@@ -10,9 +10,9 @@ type ClientOption struct {
 	name           *string
 	secret         *string
 	check_interval *time.Duration //链接检测,不能说断链了就马上去连,这会造成不必要的资源消耗。单位就是 time.Duration 本身,不要再乘 time.Second
-	heart_interval *time.Duration //心跳检测的间隔。单位就是 time.Duration 本身
 	is_wrap_error  *bool
 	coder_type     *coder.T //事件参数的编码方式,默认为 Msgp
+	connOption
 }
 
 func ClientOptions() *ClientOption {
@@ -49,7 +49,7 @@ func (this *ClientOption) SetHeartInterval(t time.Duration) *ClientOption {
 	if this == nil {
 		return this
 	}
-	this.heart_interval = &t
+	this.HeartInterval = &t
 	return this
 }
 
@@ -81,16 +81,13 @@ func (this *ClientOption) merge(opt *ClientOption) {
 	if opt == nil {
 		return
 	}
+	this.connOption.merge(&opt.connOption)
 	if opt.name != nil {
 		this.name = opt.name
 	}
 
 	if opt.check_interval != nil {
 		this.check_interval = opt.check_interval
-	}
-
-	if opt.heart_interval != nil {
-		this.heart_interval = opt.heart_interval
 	}
 
 	if opt.secret != nil {
@@ -100,7 +97,6 @@ func (this *ClientOption) merge(opt *ClientOption) {
 	if opt.is_wrap_error != nil {
 		this.is_wrap_error = opt.is_wrap_error
 	}
-
 	if opt.coder_type != nil {
 		this.coder_type = opt.coder_type
 	}
@@ -174,4 +170,13 @@ func (this *ServerOption) SetIsWrapError(b bool) *ServerOption {
 	}
 	this.is_wrap_error = &b
 	return this
+}
+
+type SendOption struct {
+	timeout *time.Duration
+	ct      *coder.T
+}
+
+func SendOptions() *SendOption {
+	return &SendOption{}
 }

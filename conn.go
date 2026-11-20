@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,7 +30,7 @@ const (
 	// IOV_MAX = 1024，每帧最多 2 个 iovec，所以一批最多 512 帧
 	maxBatchFrames = 512
 	sendChanSize   = 30
-	msgChanSize    = 256
+	msgChanSize    = maxBatchFrames //最低得是这个值
 )
 
 // Handler 处理收到的业务帧（flag_msg）的 body
@@ -42,7 +43,6 @@ type connOption struct {
 	HeartInterval      *time.Duration // 看门狗周期；空闲超过它才发 PING
 	ReadTimeoutFactor  *float64       // 判死时限 = HeartInterval * 该系数，默认 2.2
 	WriteTimeoutFactor *float64       // 单次 writev 的上限 = HeartInterval * 该系数，默认 2.2
-	HandshakeTimeout   *time.Duration // pump 启动前握手读写的超时
 }
 
 func ConnOptions() *connOption {
@@ -73,14 +73,6 @@ func (this *connOption) SetWriteTimeoutFactor(f float64) *connOption {
 	return this
 }
 
-func (this *connOption) SetHandshakeTimeout(d time.Duration) *connOption {
-	if this == nil {
-		return this
-	}
-	this.HandshakeTimeout = &d
-	return this
-}
-
 func (this *connOption) merges(opts ...*connOption) *connOption {
 	for _, opt := range opts {
 		this.merge(opt)
@@ -100,9 +92,6 @@ func (this *connOption) merge(opt *connOption) {
 	}
 	if opt.WriteTimeoutFactor != nil {
 		this.WriteTimeoutFactor = opt.WriteTimeoutFactor
-	}
-	if opt.HandshakeTimeout != nil {
-		this.HandshakeTimeout = opt.HandshakeTimeout
 	}
 }
 
@@ -142,10 +131,9 @@ type Conn struct {
 
 	handler Handler
 
-	heartInterval    time.Duration
-	readTimeout      time.Duration
-	writeTimeout     time.Duration
-	handshakeTimeout time.Duration
+	heartInterval time.Duration
+	readTimeout   time.Duration
+	writeTimeout  time.Duration
 
 	// 只有 writePump 这一个 goroutine 从 socket 写；其他 goroutine 一律通过 sendChan 投递。
 	// sendChan 永远不 close：close 会和生产者竞态，靠 ctx + closed 收尾。
@@ -169,7 +157,7 @@ type Conn struct {
 	closeErr error
 }
 
-func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
+func New(ctx context.Context, conn net.Conn, handler Handler, opts ...*connOption) *Conn {
 	// 先铺默认值，再让调用方的 opts 覆盖（merge 只认非 nil 字段），
 	// 与 client.go / server.go 的写法保持一致；这样下面解引用不用再判 nil
 	const defaultHeartInterval = 5 * time.Second
@@ -177,7 +165,6 @@ func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 		SetHeartInterval(defaultHeartInterval).
 		SetReadTimeoutFactor(2.2). // 允许丢 1 个心跳，并允许第 2 个晚到 20%
 		SetWriteTimeoutFactor(2.2).
-		SetHandshakeTimeout(5 * time.Second).
 		merges(opts...)
 
 	if *opt.HeartInterval <= 0 {
@@ -186,23 +173,22 @@ func New(conn net.Conn, handler Handler, opts ...*connOption) (*Conn, error) {
 	}
 
 	c := &Conn{
-		conn:             conn,
-		r:                bufio.NewReaderSize(conn, 16<<10),
-		handler:          handler,
-		heartInterval:    *opt.HeartInterval,
-		readTimeout:      time.Duration(float64(*opt.HeartInterval) * *opt.ReadTimeoutFactor),
-		writeTimeout:     time.Duration(float64(*opt.HeartInterval) * *opt.WriteTimeoutFactor),
-		handshakeTimeout: *opt.HandshakeTimeout,
-		sendChan:         make(chan *frame, sendChanSize),
-		bufs:             make(net.Buffers, 0, maxBatchFrames*2),
-		msgChan:          make(chan []byte, msgChanSize),
+		conn:          conn,
+		r:             bufio.NewReaderSize(conn, 16<<10),
+		handler:       handler,
+		heartInterval: *opt.HeartInterval,
+		readTimeout:   time.Duration(float64(*opt.HeartInterval) * *opt.ReadTimeoutFactor),
+		writeTimeout:  time.Duration(float64(*opt.HeartInterval) * *opt.WriteTimeoutFactor),
+		sendChan:      make(chan *frame, sendChanSize),
+		bufs:          make(net.Buffers, 0, maxBatchFrames*2),
+		msgChan:       make(chan []byte, msgChanSize),
 	}
 	c.closed.Store(false)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ctx, c.cancel = context.WithCancel(ctx)
 
 	c.nextDeadline = time.Now().Add(c.readTimeout)
 	go c.msgWorker()
-	return c, nil
+	return c
 }
 
 // Close 主动关闭，幂等。要停连接请调它，不要只调 cancel——cancel 叫不醒阻塞中的 read。
@@ -281,7 +267,7 @@ func (this *Conn) SetHandler(h Handler) {
 // Write 把 datas 组成一帧/多帧并直接落盘，绕过 sendChan。
 // 只允许在 Serve() 之前用（握手）：那时 writePump 还没起，不存在并发写，
 // 也就不会和 this.bufs / sendChan 抢。
-func (this *Conn) Write(datas ...[]byte) (err error) {
+func (this *Conn) WriteToConn(timeout time.Duration, datas ...[]byte) (err error) {
 	var bufs net.Buffers
 	frames := make([]*frame, 0, len(datas))
 	for _, data := range datas {
@@ -304,7 +290,7 @@ func (this *Conn) Write(datas ...[]byte) (err error) {
 			f.Release()
 		}
 	}()
-	if err := this.conn.SetWriteDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+	if err := this.conn.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
 		err = fmt.Errorf("set write deadline: %w", err)
 		this.CloseWithError(err)
 		return err
@@ -318,8 +304,8 @@ func (this *Conn) Write(datas ...[]byte) (err error) {
 }
 
 // Read 直接读一帧。同样只允许在 Serve() 之前调用。
-func (this *Conn) Read() (body []byte, err error) {
-	if err = this.conn.SetReadDeadline(time.Now().Add(this.handshakeTimeout)); err != nil {
+func (this *Conn) Read(timeout time.Duration) (body []byte, err error) {
+	if err = this.conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return nil, fmt.Errorf("set read deadline: %w", err)
 	}
 	_, body, err = this.read()
@@ -340,11 +326,11 @@ func (this *Conn) closedErr() error {
 // 通道满时阻塞，直到写出去、ctx 结束或连接关闭。
 // 注意：返回只代表"已入队"，data 的所有权要等 writev 完成才真正交出去，
 // 调用方在此之前不能复用/归还 data。
-func (this *Conn) write(flag byte, data []byte) error {
+func (this *Conn) Write(data []byte) error {
 	if this.closed.Load() {
 		return this.closedErr()
 	}
-	f, err := newFrame(flag, data)
+	f, err := newFrame(flag_msg, data)
 	if err != nil {
 		return err
 	}
@@ -360,7 +346,7 @@ func (this *Conn) write(flag byte, data []byte) error {
 // tryWrite 非阻塞投递。通道满就返回 false，由调用方决定丢弃还是报错。
 // pong 和 writePump 的心跳必须走这里：它们本身就在 writePump/readPump 里，
 // 用阻塞的 write 会自己等自己，直接死锁。
-func (this *Conn) tryWrite(flag byte, data []byte) bool {
+func (this *Conn) TryWrite(flag byte, data []byte) bool {
 	if this.closed.Load() {
 		return false
 	}
@@ -444,7 +430,7 @@ func (this *Conn) read() (flag byte, body []byte, err error) {
 
 // ping 由 writePump 的 pingTimer 调用（只有空闲时才会触发），非阻塞投递
 func (this *Conn) ping() {
-	if !this.tryWrite(flag_ping, nil) {
+	if !this.TryWrite(flag_ping, nil) {
 		// 通道里还排着数据，说明连接本来就活跃，这个周期跳过 PING 是安全的
 		slog.Warn("ping", "err", "send buffer full, skip ping")
 	}
@@ -453,7 +439,7 @@ func (this *Conn) ping() {
 // pong 由 readPump 调用。丢弃 PONG 是安全的：对方下个周期会重试 PING，
 // 或者对方发业务数据时也会刷新活跃状态，所以不应该因此关连接。
 func (this *Conn) pong() {
-	if !this.tryWrite(flag_pong, nil) {
+	if !this.TryWrite(flag_pong, nil) {
 		slog.Warn("pong", "err", "send pong buffer full")
 	}
 }
@@ -534,7 +520,6 @@ func (this *Conn) writePump() (err error) {
 func (this *Conn) readPump() error {
 	for {
 		now := time.Now()
-
 		if now.After(this.nextDeadline.Add(-this.heartInterval)) {
 			this.nextDeadline = now.Add(this.readTimeout)
 			if err := this.conn.SetReadDeadline(this.nextDeadline); err != nil {
@@ -558,7 +543,9 @@ func (this *Conn) readPump() error {
 				select {
 				case this.msgChan <- body:
 				case <-this.ctx.Done():
-					return nil
+					return this.ctx.Err()
+				default:
+					return errors.New("msgChan is full")
 				}
 			}
 		case flag_ping:

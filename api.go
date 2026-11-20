@@ -10,19 +10,25 @@ import (
 )
 
 func (this *Client) Emit(en eventname.T, args ...any) error {
-	return this.emit(msgtype.Req, en, args...)
+	call := <-this.EmitAsync(en, args...).Done
+	return call.Err
 }
 
 func (this *Client) EmitAsync(en eventname.T, args ...any) (call *Call) {
-	return this.emit_async(msgtype.Req, en, args...)
+	return this.emit_async(msgtype.Req, en, *this.opt.coder_type, args...)
 }
 
 func (this *Client) EmitSomeOne(en eventname.T, args ...any) error {
-	return this.emit(msgtype.ReqRandOne, en, args...)
+	call := <-this.EmitSomeOneAsnyc(en, args...).Done
+	return call.Err
 }
 
 func (this *Client) EmitSomeOneAsnyc(en eventname.T, args ...any) *Call {
-	return this.emit_async(msgtype.ReqRandOne, en, args...)
+	return this.emit_async(msgtype.ReqRandOne, en, *this.opt.coder_type, args...)
+}
+
+func (this *Client) Builder() *builder {
+	return &builder{client: this}
 }
 
 // 监听事件
@@ -76,20 +82,20 @@ func (this *Client) On(t eventname.T, Func any) error {
 	this.rwl.Lock()
 	var isExist bool
 	var methods []*method
-	var existTP *topic.Topic
-	for tp, ev := range this.topics {
-		if tp.Equal(t) {
-			methods = append(ev, mType)
-			existTP = tp
+	var existIdx int
+	for i := range this.topics {
+		if this.topics[i].tp.Equal(t) {
+			methods = append(this.topics[i].methods, mType)
+			existIdx = i
 			isExist = true
 			break
 		}
 	}
 	if isExist {
-		this.topics[existTP] = methods
+		this.topics[existIdx].methods = methods
 	} else {
 		methods = []*method{mType}
-		this.topics[newtp] = methods
+		this.topics = append(this.topics, topicEntry{tp: newtp, methods: methods})
 	}
 	this.rwl.Unlock()
 	if !isExist {
