@@ -363,19 +363,47 @@ func (this *nodeCall) hasTarget(name string) bool {
 // ---------------------------------------------------------------------------
 
 func (this *Client) onRegisterRes(list []nodeInfo) {
+	this.l.Lock()
+	seen := make(map[string]bool, len(list))
 	for _, ni := range list {
 		if ni.Name == this.name {
 			continue
 		}
-		this.l.Lock()
-		_, exists := this.wantPeers[ni.Name]
-		if !exists {
+		seen[ni.Name] = true
+	}
+	// 服务端下发的列表是「当前完整列表」，用来对齐 wantPeers：
+	// 不在列表里的节点（已下线/未重新注册）要从 wantPeers 里清掉，否则
+	// keepAlivePeer 会无限重连一个不存在的节点。
+	var toAdd []nodeInfo
+	var toDrop []string
+	for _, ni := range list {
+		if ni.Name == this.name {
+			continue
+		}
+		if _, exists := this.wantPeers[ni.Name]; !exists {
 			this.wantPeers[ni.Name] = ni.Addrs
+			toAdd = append(toAdd, ni)
 		}
+	}
+	for name := range this.wantPeers {
+		if !seen[name] {
+			delete(this.wantPeers, name)
+			toDrop = append(toDrop, name)
+		}
+	}
+	this.l.Unlock()
+
+	// 关闭被移除节点的连接（触发 Serve 返回 → disconnectPeer 清理 → keepAlivePeer 退出）
+	for _, name := range toDrop {
+		this.l.Lock()
+		c := this.peers[name]
 		this.l.Unlock()
-		if !exists {
-			go this.keepAlivePeer(ni.Name, ni.Addrs)
+		if c != nil {
+			_ = c.Close()
 		}
+	}
+	for _, ni := range toAdd {
+		go this.keepAlivePeer(ni.Name, ni.Addrs)
 	}
 }
 
