@@ -477,7 +477,7 @@ func (this *Conn) writePump() (err error) {
 		var f *frame
 		select {
 		case <-this.ctx.Done():
-			return nil
+			return this.ctx.Err()
 		case f = <-this.sendChan:
 		case <-pingTimer.C:
 			// ping 走 TryWrite：writePump 自己是 sendChan 唯一的消费者，
