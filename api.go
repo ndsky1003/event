@@ -55,7 +55,6 @@ func (this *Client) Builder() *builder {
 }
 
 // 监听事件
-// if t is reg , first param must the value of reg.FindStringSubmatch(et)
 func (this *Client) On(t eventname.T, Func any) error {
 	if t == "" {
 		return errors.New("eventname must not empty")
@@ -74,33 +73,18 @@ func (this *Client) On(t eventname.T, Func any) error {
 	if !rv.IsValid() {
 		return errors.New("regist func is nil")
 	}
-	inCount := rt.NumIn()
-	length := inCount
 	newtp, err := topic.New(t)
 	if err != nil {
 		return err
 	}
-	var inStart int
-	if newtp.IsReg {
-		if inCount < 1 {
-			return errors.New("regist reg Func, first param must exist")
-		}
-		if rt.In(0) != sliceType {
-			return errors.New("regist reg Func, first param must []string type")
-		}
-		inStart = 1
-		inCount = inCount - 1
-	}
-
-	argsType := make([]*argType, 0, inCount)
-	for i := inStart; i < length; i++ {
-		at := rt.In(i)
-		argsType = append(argsType, &argType{at: at})
+	argsType := make([]*argType, 0, rt.NumIn())
+	for i := 0; i < rt.NumIn(); i++ {
+		argsType = append(argsType, &argType{at: rt.In(i)})
 	}
 	mType := &method{
 		function:  rv,
 		argsType:  argsType,
-		argsCount: inCount,
+		argsCount: rt.NumIn(),
 	}
 	this.rwl.Lock()
 	var isExist bool
@@ -122,13 +106,9 @@ func (this *Client) On(t eventname.T, Func any) error {
 	}
 	this.rwl.Unlock()
 	if !isExist {
-		// 同步注册。用 go 的话，On 之后紧跟的 Emit 可能先到达服务端——
-		// 那时 topic 还没注册，事件直接变成"无人监听"被丢掉，而且不报错。
-		// 服务端现在也是同步处理单条连接的消息（service.HandleMsg），
-		// 两端一起才真正保证顺序。
-		// 连接还没起来时 regist_topic 会隔 2s 重试直到成功，所以这里会阻塞
-		// 到连上为止，保证 On 返回时 topic 已在服务端就位。
-		this.regist_topic()
+		// 广播订阅：告诉所有 peer"我订阅了这个 topic"。
+		// peer 订阅表（subs）据此把后续的 Emit 点对点路由过来。
+		this.broadcastSubscribe(t)
 	}
 	return nil
 }

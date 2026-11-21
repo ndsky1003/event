@@ -1,6 +1,6 @@
 # AGENTS.md
 
-基于观察者模式的事件总线库：通过 TCP 在多个进程间做事件订阅/发布（README 场景是"多服务器配置文件检查"）。消息框架（`Msg`/`MsgVerifyReq`/`MsgVerifyRes`）统一走 `coder.Msgp` 编解码；事件参数 body 走 `coder/` 子包（由 `Msg.Coder` 字段声明，默认 `coder.Msgp`）。原来的 `codec/` 包（gob）已删除。
+基于观察者模式的事件总线库：**p2p 模式**——通过 TCP/UDS 在多个进程间做事件订阅/发布。没有中心路由节点，靠一个轻量服务端发现彼此，节点之间订阅广播 + 事件点对点路由。消息框架（`Msg`/`MsgVerifyReq`/`MsgVerifyRes`）统一走 `coder.Msgp`；事件参数 body 走 `coder/` 子包（由 `Msg.Coder` 字段声明，默认 `coder.Msgp`）。
 
 ## 构建与验证
 
@@ -9,47 +9,46 @@ go build ./...
 go vet ./...
 ```
 
-- 模块路径是 `github.com/ndsky1003/event/v2`（带 `/v2`，import 时必须带上）。
-- 当前工作分支是 `v2`；仓库另有 `main`、`v3` 分支，注意别改错分支。
-- `go test ./...` 的 `client_test.go` 里 `TestMain` 会真实监听 `127.0.0.1:8080`，端口被占用会 panic，跑测试前先确认端口空闲。
-- 现在有真测试了：`integration_test.go`（端到端：收发/错误回传/正则 topic/心跳/重连/secret/多监听者聚合/断线结算等）、`conn_test.go`（连接层：写后关闭/超长帧）、`coder/`（各 coder 往返 + benchmark）。`client_test.go` 里只剩 `TestMain` 和 `BenchmarkEmit`。
+- 模块路径是 `github.com/ndsky1003/event/v3`（带 `/v3`，import 时必须带上）。
+- `go test ./...` 的 `client_test.go` 里 `TestMain` 会真实监听 `127.0.0.1:8080`（服务端）并让一个节点监听 `127.0.0.1:18081`，端口被占用会 panic，跑测试前先确认端口空闲。
+- 真测试在 `integration_test.go`（端到端 p2p：收发/错误回传/多监听者聚合/EmitSomeOne/EmitAsync/EmitBatch/心跳/重连/secret/UDS/服务端重启/节点下线通知/本地 On 后 Emit 等）、`conn_test.go`（连接层：写后关闭/超长帧）、`coder/`（各 coder 往返 + benchmark）。
 - 快速验证：`go build ./... && go vet ./... && go test -race ./...`。
 
 ## 架构
 
-- `server.go`：服务端，`NewServer()`（`server` 类型未导出），`Listen`/`Listens` 监听（**阻塞**），`Shutdown()` 关闭（幂等，`closed` 用 CAS）。topic 索引拆成 `exact map[eventname.T]*topicSids`（普通 topic 查表命中）和 `regs`（正则只能线性扫），**不要在锁内遍历全部 topic**——旧写法实测 10000 个 topic 时 QPS 掉到 3060，查表写法 5467。`this.l` 保护 `exact`/`regs`/`services`/`pending`/`service.tps`/`listeners`。
-- 服务端生命周期：listener 必须登记进 `server.listeners`，否则关不掉，`listen()` 里的 Accept 错误分支就成了永久忙循环。`acceptWg` / `connWg` 要**分开**：`Shutdown` 的顺序是"关 listener → 等 accept 循环退出 → 断连接 → 等 handle_conn 退出 → `tm.Stop()`"，合成一个 WaitGroup 就是自己等自己（连接没断，handle_conn 不会返回）。
-- `client.go`：客户端 `Dial(url, opts...)`，内含自动重连（`keepAlive`，拨号/握手失败时指数退避）、注册 topic（`regist_topic`）。**`Close()` 是终态**（置 `closed`、`cancel` 让 `keepAlive` 退出、幂等，返回关闭原因），不用 `Close` 就会漏 goroutine 和连接。
-- `conn.go`：传输层核心。`Conn` 持 `conn net.Conn` + `bufio.Reader`，帧格式 `[magic 1B][flag 1B][body 长度 4B BigEndian][body]`，单帧 body 上限 `maxFrameSize` 64KB；`flag_msg`/`flag_ping`/`flag_pong`。只有 `writePump` 一个 goroutine 写 socket，别人通过 `sendChan`（容量 30）投递，`writePump` 攒批后用 `net.Buffers` 一次 writev 发出。心跳与断连检测在这一层（`heartInterval` 看门狗 + `pingTimer` 空闲才 PING，判死时限 `2.2 * heartInterval`）。`Serve()` 起读写泵并阻塞到连接结束；`Close()`/`CloseWithError()` 幂等，`cancel` 叫醒 writePump、关 socket 叫醒 readPump。`WriteToConn(timeout, ...)`/`Read(timeout)` 是握手用的同步读写，只允许在 `Serve()` 之前调用。
-- `api.go`：对外 `On` / `Emit` / `EmitAsync` / `EmitSomeOne` / `EmitSomeOneAsnyc`。
-- `service.go`：服务端每条连接的封装，只做消息框架的编解码与分发（统一 `coder.Msgp`）；原来的 `sendChan`（容量 30）和 `codec`/`envCoder` 字段已删，发送队列在 `Conn` 里。另外记一笔 `tps`（这条连接注册过哪些 topic，断线时只摘这几条），由 `server.l` 保护。
-- 断线收尾：`server_call.targets` 记下这次请求投递给了谁；连接死掉时 `closeLocked` **扫全部 pending** 找出它欠的响应并立即结算。别改成"每条连接维护一个 inflight 表"——那是 per-request 的 map 写，实测吃掉约 7% 吞吐，而断线是罕见路径。
-- 消息框架（`Msg`/`MsgVerifyReq`/`MsgVerifyRes`）统一走 `coder.Msgp` 编解码，帧 body 就是纯 Msgp 字节、没有 coder 标记——原来的 `envelope.go`（`[1 字节 coder 标记][coder 编码出来的结构体]`）方案已废弃删除。
-- 事件参数 body 走 `coder/` 子包（`coder.Encode`/`coder.Decode`）：优先 msgp（`msgp.Marshaler`/`Unmarshaler`，业务方 codegen 后命中），否则 msgpack 反射兜底。参数用哪种 coder 由 `Msg.Coder` 字段声明，与消息框架（固定 Msgp）互不影响；`coder.Raw` 只透传 `[]byte`，编不了结构体。
-- `msg/`：线协议结构 `Msg`（含 `MsgVerifyReq/Res` 握手），字段带 `msgpack` 短 tag；`msgtype/`：消息类型枚举；`topic/`：topic 匹配（支持正则）；`eventname/`：事件名类型。
-- `*_gen.go` 是 msgp codegen 产物，**库自己的类型也已全部 codegen**（`msg`/`msgtype`/`eventname`/`coder` 四个包）。改了这些类型的字段后要重新生成：`go generate ./...`，指令是 `//go:generate msgp -tests=false`，所以**本机 PATH 里必须有 `msgp`**（`go install github.com/tinylib/msgp@v1.6.5`）。`-tests=false` 表示不生成 `*_gen_test.go`，`msg` 包因此没有自己的测试，它的往返正确性由 `integration_test.go`（端到端真实收发）覆盖（走真实 coder 路径，比生成的测试更贴近实际）。实测收益：消息框架编码 999→71 ns/op、解码 444→95 ns/op、分配 20→2 次。
-  - 工具与库版本已对齐：`go.mod` 里 `github.com/tinylib/msgp` 升到 **v1.6.5**，和本机 `msgp` 一致。代价是 msgp v1.6.5 要求 `go >= 1.24`，所以本模块的 `go` 指令从 1.20 抬到了 **1.24**——**下游使用者必须用 Go 1.24+**。想保住低版本的话：msgp v1.3.0 只要 go 1.20，v1.4.0/v1.5.0 要 go 1.22。
+- **服务端** `server.go`：`NewServer()`，`Listen`/`Shutdown`。只做三件事：节点注册（`Register`/`RegisterRes`）、列表下发、下线通知（`NodeDown`）。**不参与事件路由**。`nodes map[name]*serverNode` 由 `l` 保护。
+- **节点** `client.go`：`Dial(dirAddr, opts...)` 返回 `*Client`。节点既是发布者也是订阅者，内部三种连接：
+  - `serverConn`：连服务端（`keepAliveServer` 重连），注册拿列表。
+  - `peers`：与其他节点的对等连接。新节点主动连老节点（`keepAlivePeer` 重连），老节点 accept（`handlePeerIn`，不主动重连，对方会重连）。
+  - `ln`：节点自己的监听器（`SetListenAddr` 指定），接受其他节点连接。
+- **订阅广播**：`On` 本地记录 + `broadcastSubscribe` 给所有 peer；新 peer 连接建立时 `broadcastAllSubscribe` 补发自己的全部订阅。节点各自维护订阅表 `subs map[eventname.T]map[peerName]struct{}`。peer 断线 `disconnectPeer` 从 `subs` 里清掉它。
+- **事件路由**：`Emit` 查 `subs[en]` 得到订阅者 peer 集合，本地 `execLocal` 执行 + 点对点发 `Req` 给各 peer，等全部回包后聚合。`nodeCall`（`client.go`）做跨 peer 聚合（`peerCount` 递减、`settled` 去重、`errs` 聚合）。`EmitSomeOne`（`ReqRandOne`）本地有订阅者则本地最快直接返回，否则等第一个 `ResRandOne`。
+- **节点收 Req**：`func_call` 本地匹配执行回调并回 `Res`/`ResRandOne` 给来源 peer。回调 panic 会被 recover 兜底回错误包。
+- **断线收尾**：`disconnectPeer` 清 peers/subs 后**扫全部 pending**，找出该 peer 欠的请求并立即结算（`settleLocked`），不让发布者干等。别改成 per-peer inflight 表——断线是罕见路径。
+- 锁顺序固定为 `rwl -> l`：`rwl` 保护 `topics`，`l` 保护 `serverConn/peers/wantPeers/subs/pending/ln`。持 `l` 的路径绝不再拿 `rwl`。
+- 已删除：`server.go`、`service.go`（原 C/S 中心路由）。`service.go` 的握手逻辑提炼成 `server.go` 里的 `serverSideVerify`/`clientSideVerify` 共享函数。
 
 ## 关键语义（容易踩坑）
 
-- `On(t, Func)` 会用 `panic` 校验 `Func`：必须是 func、必须有且仅有一个 `error` 返回值。**panic 是设计行为，不是 bug**。
-- **单条连接上的消息必须按序处理**：`On` 里注册 topic 是**同步**调 `regist_topic()`，服务端 `service.HandleMsg` 也是**同步**调 `server.handle()`。任何一处改回 `go ...`，`On` 之后紧跟的 `Emit` 就可能先被服务端处理，那次 Emit 变成"无人监听"，**不报错、不送达、事件静默消失**（`TestOnThenEmitIsNotLost` 会红）。服务端 `handle` 只做索引改动和转发、不跑用户代码，所以同步不耗时；业务回调的耗时在客户端 `func_call` 里异步消化。
-- `Dial` 是异步的：`connect()` 在后台拨号。`On` 把 topic 记在本地后**同步**调 `regist_topic()` 上报；连接还没起来时 `regist_topic` 隔 2s 重试直到成功，所以 `On` 会阻塞到连上为止。测试里要测"On 之后紧跟 Emit 不丢"，得先等连接建立（测试辅助 `isConnected`）再 `On`。
-- `Conn.Write`/`TryWrite` 的返回值**不能返回 nil 表示失败**：上层靠 `err != nil` 判断，返回 nil 就是"消息没进发送队列却被当成发送成功"。关闭原因统一走 `closedErr()`（保证非 nil）；`TryWrite` 返回 bool，通道满即 false。
-- `server_call.settled` 是给 `serverReqCount--` 做幂等的，别删：同一个 sid 被结算两次会把 uint64 计数减成负数，pending 再也等不到 0。
+- `On(t, Func)` 用 `panic` 校验 `Func`：必须是 func、必须有且仅有一个 `error` 返回值。**panic 是设计行为**。
+- **p2p 不再支持正则 topic**：正则无法用订阅表精确路由，`topic.Topic` 只做精确匹配，`On` 里正则相关校验（`[]string` 第一个参数）已删。
+- **订阅同步是异步的**：`On` 广播 `Subscribe` 有网络窗口。同一节点 `On` 后紧跟 `Emit` 不丢（本地 `execLocal` 直接执行）；跨节点 `On → Emit` 要等订阅同步（测试 `waitRoute` 等 `subCount` 到位）。这是与旧 C/S「跨连接无顺序保证」一致的语义。
+- `Dial` 是异步的：`keepAliveServer` 后台拨号。`SetListenAddr` 默认 `127.0.0.1:0`（随机端口，`startListen` 同步监听后回填实际地址注册到服务端），可变参数支持多地址（`unix://` 或 `ip:端口`，UDS 保留 `unix://` 前缀、TCP 才回填）；`SetName` 全网唯一（服务端重名拒绝）。
+- `Conn.Write`/`TryWrite` 返回值**不能返回 nil 表示失败**：上层靠 `err != nil` 判断。关闭原因统一走 `closedErr()`。
 - 客户端 `seq` 单调递增、**不要归零**：归零后旧连接迟到的 `Res(seq=N)` 可能结算到新连接的 call 上。
-- 正则 topic 写法是 `/db_[a-z]+/`（前后带 `/`，见 `eventname.IsReg`）。注册正则 topic 时，回调的**第一个参数必须是 `[]string`**（对应 `regexp.FindStringSubmatch` 的结果）。
-- 回调的入参类型必须与 `Emit` 传入的参数一一对应（msgpack 解码按 `method.argsType` 已存类型解，类型不匹配会报错；参数不够会补零值）。具体类型无需注册；**`interface{}` 参数会丢失具体类型**（整数可能解成 `int8`/`int64`），别用接口参数。
-- msgp 快路径（可选，针对**业务方参数类型**）：跑 `msgp` 生成 `*_gen.go` 后，**值类型参数**（`func(o Outer)`）走 msgp（`MarshalMsg`/`UnmarshalMsg`，基于 []byte）；**指针类型参数**（`func(o *Outer)`）因解码目标是 `**T`（为还原 nil），仍走 msgpack 兜底。两者 struct 默认都是 map 格式，互通。注意：msgp 的 `Decodable`（`DecodeMsg`）内部走 fwd.Reader 缓冲、连续解码会预读丢字节，所以 `coder/msgpack_coder.go` 里只用 `UnmarshalMsg`。
-- msgpack 整数解码**不校验溢出**：`Emit` 传的整数与回调入参位宽不一致会静默截断（如 `int64(300)` 解成 `int8` 得 `44`，不报错），务必保证类型严格一致。
-- `Emit`（`msgtype.Req`）等所有监听者都返回才完成；`EmitSomeOne` 只等最快的响应。`EmitAsync` 返回 `*Call`（`call.Err` / `<-call.Done`）。
-- 服务端 `req` 投递失败会**立即**释放 pending（`dispatch_failed` 复用 `res` 的计数与聚合），发布者不会干等 `Timeout`（默认 10s）。但监听者**收包之后**才死/卡死，仍然只能等 Timeout——服务端不替它回包，避免"事件可能已被业务处理"时的重复消费语义。
-- 客户端 `Emit` 自己**没有超时**，全靠服务端回包、或连接断开时 `disconnect`/`stopLocked` 把 pending 全部 `call.done()` 掉。所以给服务端设 `SetTimeout` 时要清楚：它同时是"监听者卡死时发布者的最长阻塞时间"。
-- 单个事件参数个数受 `Msg.BodyCount`（`int8`）限制，别传超过 127 个参数。
-- 错误会默认被包装（`SetIsWrapError`，默认 `true`），用 `errors.Is` 判断时注意包装链上的 `ErrClient`/`ErrServer`/`ErrConnClosed` 等哨兵错误（定义在 `err.go`）。
-- `msg.Msg` 上的 `msgpack:"..."` tag **就是线上协议**：msgpack map 格式每条消息都带字段名，短 tag 一条省 50 字节上下。字段名对不上时解码端**不报错、只静默丢字段**，所以两端必须同源。实测 tinylib/msgp codegen 只认 `msgpack:"..."`（忽略 `msgp:"..."` 和 `json:"..."`），所以给 `msg.Msg` 跑 codegen 不会改变线上格式。
-- `Client` 的锁顺序固定为 `rwl -> l`：持 `l` 的路径绝不再去拿 `rwl`，否则与 `On`/`regist_topic_lock`/`disconnect`/`Close` 交叉死锁。
-- **吞吐瓶颈是 syscall，不是序列化**：饱和点 profile 里 `writev`+`read` 占 86%，编码/锁/reflect 加起来不到 3%。同步 `Emit` 是 stop-and-wait，`QPS = 在途并发 / 往返延迟`，`net.Buffers` 平均只攒到 1.18 帧（无货可攒）。要提吞吐靠 `EmitAsync` 流水线（batch 升到 5.86、QPS ×2~3）或加并发，**别去抠编码和拷贝**。实测数字见 `TODO.md` 性能第 3 条。
-- **`Conn.r`（`bufio.Reader`）不能去，读侧的 copy 也别抠**：去掉 bufio 每帧多 2 次 syscall，实测吞吐 **-10%~-16%**；反过来把 bufio 的 copy + `make([]byte, size)` 全干掉（复用缓冲，忽略正确性）端到端只有 **-0.5%~+1.8%**，在 4% 噪声底里。真要做零拷贝读得先解决 `Client.HandleMsg` 里 `go func_call` 留存 `body` 的问题，收益 <4%，不划算。
-- **压测方法学**：单进程跑（服务端 + 所有客户端同进程）会把吞吐压低约 2.5 倍，必须分进程；插桩用的全局原子计数器、回调里的锁都会显著改变结果；本机背景负载约 1.2 核且波动，同一配置能测出 27K 和 77K。要交替跑、取中位数。
-- `go.mod` 是 `go 1.24`（被 msgp v1.6.5 抬上去的），循环变量**每轮独立**，闭包捕获循环变量不再需要 `idx := i`（`integration_test.go` 里那处显式捕获现在只是冗余，留着无害）。注意这是从 1.20 升上来的语义变化，老代码里如果有依赖"共享循环变量"的写法，行为会变。
+- 回调入参类型必须与 `Emit` 传参一一对应（msgpack 解码按 `method.argsType` 已存类型解）。**`interface{}` 参数会丢失具体类型**，别用接口参数。
+- msgpack 整数解码**不校验溢出**：位宽不一致会静默截断，务必类型严格一致。
+- `Emit` 等所有监听者返回；`EmitSomeOne` 等最快；`EmitAsync` 返回 `*Call`。
+- 投递失败（`writeToPeer` 报错）会立即结算该 peer（复用 `resolve`），发布者不会干等。监听者**收包之后**才死/卡死，只能等连接断开（`disconnectPeer` 结算）——没有超时兜底（节点 `Emit` 本身无 Timeout，靠 peer 回包或断线）。
+- 单个事件参数个数受 `Msg.BodyCount`（`int8`）限制，最多 127 个。
+- `msg.Msg` 的 `msgpack:"..."` tag 就是线上协议，两端必须同源。改字段要重新 `go generate ./...`（见下）。
+- msgp 快路径：跑 `msgp` 生成 `*_gen.go` 后，值类型参数走 msgp，指针类型参数（解码目标是 `**T`）仍走 msgpack 兜底。msgp 的 `Decodable` 内部走 fwd.Reader 会预读丢字节，所以 `coder/msgpack_coder.go` 只用 `UnmarshalMsg`。
+- **`Conn.r`（`bufio.Reader`）不能去**：去掉每帧多 2 次 syscall，吞吐 -10%~-16%。读侧 copy 也别抠，收益 <4%。
+- **压测方法学**：单进程跑会把吞吐压低约 2.5 倍，必须分进程（`cmd/bench`）；插桩全局原子计数器、回调里的锁都会显著改变结果；本机背景负载波动大，要交替跑取中位数。
+
+## msgp codegen
+
+`*_gen.go` 是 msgp codegen 产物，库自己的类型已全部 codegen（`msg`/`msgtype`/`eventname`/`coder`）。改了类型字段后重新生成：`go generate ./...`，指令 `//go:generate msgp -tests=false`，本机 PATH 必须有 `msgp`（`go install github.com/tinylib/msgp@v1.6.5`）。
+
+- 工具与库版本已对齐：`github.com/tinylib/msgp` v1.6.5，要求 `go >= 1.24`，本模块 `go` 指令是 1.27。
+- `msgtype.T` 的枚举追加了新值（`Register`/`RegisterRes`/`NodeDown`/`Subscribe`/`Unsubscribe`），不影响已有取值，编解码是 uint8，无需重新生成 t_gen.go。

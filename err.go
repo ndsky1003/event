@@ -18,6 +18,4 @@ var (
 )
 
 // var errType = reflect.TypeOf((*error)(nil)).Elem()
-// var sliceType = reflect.TypeOf((*[]string)(nil)).Elem()
-var sliceType = reflect.TypeFor[[]string]()
 var errType = reflect.TypeFor[error]()

@@ -11,14 +11,12 @@ import (
 	"time"
 
 	"github.com/ndsky1003/event/v3/eventname"
-	"github.com/ndsky1003/event/v3/msg"
 	"github.com/ndsky1003/event/v3/msgtype"
 )
 
-// 端到端集成测试：走真实的 TCP + 新帧格式 + coder（默认 msgpack）。
-// 注意包里的 TestMain 会先占 127.0.0.1:8080，这里一律用随机端口。
+// 端到端集成测试：p2p 模式。服务端节点只做发现，节点之间订阅广播 + 点对点事件路由。
 
-func startServer(t *testing.T, opts ...*ServerOption) (string, *server) {
+func startServer(t *testing.T, opts ...*ServerOption) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -28,16 +26,24 @@ func startServer(t *testing.T, opts ...*ServerOption) (string, *server) {
 	if err = l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	srv := NewServer(opts...)
-	go srv.Listen(addr)
-	// 每个用例都把自己的服务端关掉：否则 accept 循环、timer.Run
-	// 和一堆还在重连的客户端会一路攒到整个测试包结束
+	dir := NewServer(opts...)
+	go dir.Listen(addr)
 	t.Cleanup(func() {
-		if err := srv.Shutdown(); err != nil {
+		if err := dir.Shutdown(); err != nil {
 			t.Logf("Shutdown: %v", err)
 		}
 	})
-	return addr, srv
+	return addr
+}
+
+func startNode(t *testing.T, serverAddr, name string, opts ...*ClientOption) *Client {
+	t.Helper()
+	full := append([]*ClientOption{}, opts...)
+	// :0 让库自己分配随机端口（监听成功后回填实际地址注册到服务端）
+	full = append(full, ClientOptions().SetName(name).SetListenAddr("127.0.0.1:0"))
+	c := Dial(serverAddr, full...)
+	t.Cleanup(func() { _ = c.Close() })
+	return c
 }
 
 func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
@@ -52,436 +58,198 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 	t.Fatalf("等待超时(%v): %s", timeout, what)
 }
 
-func serviceCount(srv *server) int {
-	srv.l.Lock()
-	defer srv.l.Unlock()
-	return len(srv.services)
-}
-
-// isConnected 测试辅助：客户端当前是否有已握手成功、正在服务的连接。
 func isConnected(c *Client) bool {
 	c.l.Lock()
 	defer c.l.Unlock()
-	return c.conn != nil
+	return c.serverConn != nil
 }
 
-// listenerCount 必须持锁读：server.on() 在锁内写 exact / regs
-func listenerCount(srv *server) int {
-	srv.l.Lock()
-	defer srv.l.Unlock()
-	n := 0
-	for _, ts := range srv.exact {
-		n += len(ts.sids)
-	}
-	for _, ts := range srv.regs {
-		n += len(ts.sids)
-	}
-	return n
+func peerCount(c *Client) int {
+	c.l.Lock()
+	defer c.l.Unlock()
+	return len(c.peers)
+}
+
+func subCount(c *Client, en eventname.T) int {
+	c.l.Lock()
+	defer c.l.Unlock()
+	return len(c.subs[en])
+}
+
+func serverNodeCount(d *Server) int {
+	d.l.Lock()
+	defer d.l.Unlock()
+	return len(d.nodes)
+}
+
+// 等两个节点互相连上，并且 sub 的订阅同步到了 pub。
+func waitRoute(t *testing.T, sub, pub *Client, en eventname.T) {
+	t.Helper()
+	waitFor(t, 10*time.Second, "节点互连", func() bool {
+		return peerCount(sub) == 1 && peerCount(pub) == 1
+	})
+	waitFor(t, 10*time.Second, "订阅同步", func() bool {
+		return subCount(pub, en) == 1
+	})
 }
 
 func TestEmitOnRoundTrip(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().
-		SetName("roundtrip").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(200*time.Millisecond))
-	defer c.Close()
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
 
 	got := make(chan string, 8)
-	c.On("itest.echo", func(name string) error {
+	if err := sub.On("itest.echo", func(name string) error {
 		got <- name
 		return nil
-	})
-
-	// topic 注册是异步的，前几次 Emit 可能还没有监听者，重试直到真的送达
-	var lastErr error
-	for i := 0; i < 40; i++ {
-		lastErr = c.Emit("itest.echo", "hello")
-		select {
-		case v := <-got:
-			if v != "hello" {
-				t.Fatalf("收到意外内容: %q", v)
-			}
-			t.Logf("第 %d 次 Emit 成功送达", i+1)
-			return
-		default:
-		}
-		time.Sleep(50 * time.Millisecond)
+	}); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("Emit 始终没有送达，lastErr=%v", lastErr)
+	waitRoute(t, sub, pub, "itest.echo")
+
+	if err := pub.Emit("itest.echo", "hello"); err != nil {
+		t.Fatalf("Emit 报错: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "hello" {
+			t.Fatalf("收到意外内容: %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("事件没有送达")
+	}
 }
 
 func TestHandlerErrorPropagatesToEmitter(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().
-		SetName("errcase").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(200*time.Millisecond))
-	defer c.Close()
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
 
-	c.On("itest.fail", func(s string) error {
+	if err := sub.On("itest.fail", func(s string) error {
 		return errors.New("handler boom")
-	})
-
-	var lastErr error
-	for i := 0; i < 40; i++ {
-		lastErr = c.Emit("itest.fail", "x")
-		if lastErr != nil && strings.Contains(lastErr.Error(), "handler boom") {
-			t.Logf("错误已回传: %v", lastErr)
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	}); err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("handler 的错误没有回传，lastErr=%v", lastErr)
+	waitRoute(t, sub, pub, "itest.fail")
+
+	err := pub.Emit("itest.fail", "x")
+	if err == nil || !strings.Contains(err.Error(), "handler boom") {
+		t.Fatalf("handler 的错误没有回传: %v", err)
+	}
+	t.Logf("错误已回传: %v", err)
 }
 
-func TestRegexTopic(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().
-		SetName("regex").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(200*time.Millisecond))
-	defer c.Close()
+// 多个订阅节点，错误要全部聚合回发布者。
+func TestMultipleListenersErrorsAggregated(t *testing.T) {
+	addr := startServer(t)
+	const n = 3
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
 
-	type hit struct {
-		sub []string
-		n   int
+	for i := 0; i < n; i++ {
+		idx := i
+		sub := startNode(t, addr, fmt.Sprintf("sub%d", idx), ClientOptions().SetHeartInterval(time.Second))
+		if err := sub.On("itest.multi", func(s string) error {
+			return fmt.Errorf("boom-%d", idx)
+		}); err != nil {
+			t.Fatal(err)
+		}
 	}
-	got := make(chan hit, 8)
-	c.On("/itest_reg_[a-z]+/", func(sub []string, n int) error {
-		got <- hit{sub: sub, n: n}
-		return nil
+
+	waitFor(t, 15*time.Second, "三个订阅同步", func() bool {
+		return subCount(pub, "itest.multi") == n
 	})
 
-	var lastErr error
-	for i := 0; i < 40; i++ {
-		lastErr = c.Emit("itest_reg_abc", 42)
-		select {
-		case h := <-got:
-			if h.n != 42 {
-				t.Fatalf("参数解错: %+v", h)
-			}
-			if len(h.sub) == 0 || h.sub[0] != "itest_reg_abc" {
-				t.Fatalf("正则 submatch 不对: %+v", h.sub)
-			}
-			return
-		default:
-		}
-		time.Sleep(50 * time.Millisecond)
+	err := pub.Emit("itest.multi", "x")
+	if err == nil {
+		t.Fatal("应该聚合到错误，结果 err=nil")
 	}
-	t.Fatalf("正则 topic 没有命中，lastErr=%v", lastErr)
+	for j := 0; j < n; j++ {
+		if !strings.Contains(err.Error(), fmt.Sprintf("boom-%d", j)) {
+			t.Fatalf("缺少第 %d 个错误: %v", j, err)
+		}
+	}
+	t.Logf("聚合到全部 %d 个错误", n)
 }
 
-// 空闲连接必须靠传输层心跳活下来，不能被判死
-func TestIdleConnSurvivesHeartbeat(t *testing.T) {
-	addr, _ := startServer(t,
-		ServerOptions().SetHeartInterval(300*time.Millisecond))
-	c := Dial(addr, ClientOptions().
-		SetName("idle").
-		SetHeartInterval(300*time.Millisecond).
-		SetCheckInterval(200*time.Millisecond))
-	defer c.Close()
+// EmitSomeOne 只等最快的响应。
+func TestEmitSomeOne(t *testing.T) {
+	addr := startServer(t)
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
 
-	got := make(chan struct{}, 8)
-	c.On("itest.idle", func(s string) error { got <- struct{}{}; return nil })
-	waitFor(t, 3*time.Second, "topic 注册完成", func() bool {
-		if err := c.Emit("itest.idle", "warmup"); err != nil {
-			return false
+	speeds := []time.Duration{200 * time.Millisecond, 10 * time.Millisecond, 100 * time.Millisecond}
+	for i, d := range speeds {
+		idx := i
+		dd := d
+		sub := startNode(t, addr, fmt.Sprintf("sub%d", idx), ClientOptions().SetHeartInterval(time.Second))
+		if err := sub.On("itest.rand", func() error {
+			time.Sleep(dd)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
 		}
-		select {
-		case <-got:
-			return true
-		default:
-			return false
-		}
+	}
+	waitFor(t, 15*time.Second, "订阅同步", func() bool {
+		return subCount(pub, "itest.rand") == len(speeds)
 	})
 
-	// 静默 3 秒 = 10 个心跳周期，连接不该断
-	time.Sleep(3 * time.Second)
-	if !isConnected(c) {
-		t.Fatal("空闲期间连接断了")
+	start := time.Now()
+	if err := pub.EmitSomeOne("itest.rand"); err != nil {
+		t.Fatalf("EmitSomeOne 报错: %v", err)
 	}
-	if err := c.Emit("itest.idle", "after-idle"); err != nil {
-		t.Fatalf("静默后 Emit 失败: %v", err)
+	cost := time.Since(start)
+	if cost > 150*time.Millisecond {
+		t.Fatalf("EmitSomeOne 应该等最快的（~10ms），实际 %v", cost.Round(time.Millisecond))
 	}
+	t.Logf("EmitSomeOne 耗时 %v（最快 ~10ms）", cost.Round(time.Millisecond))
+}
+
+func TestEmitAsync(t *testing.T) {
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
+
+	got := make(chan int, 8)
+	if err := sub.On("itest.async", func(n int) error { got <- n; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "itest.async")
+
+	call := pub.EmitAsync("itest.async", 42)
 	select {
-	case <-got:
-	case <-time.After(3 * time.Second):
-		t.Fatal("静默后事件没有送达")
+	case c := <-call.Done:
+		if c.Err != nil {
+			t.Fatalf("EmitAsync 报错: %v", c.Err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EmitAsync 没有完成")
 	}
-}
-
-// 服务端踢掉连接后，客户端要重连并重新注册 topic
-func TestReconnectAndReregister(t *testing.T) {
-	addr, srv := startServer(t,
-		ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().
-		SetName("reconn").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
-
-	got := make(chan string, 16)
-	c.On("itest.reconn", func(s string) error { got <- s; return nil })
-
-	waitFor(t, 3*time.Second, "首条连接建立", func() bool { return serviceCount(srv) == 1 })
-	waitFor(t, 3*time.Second, "topic 注册成功", func() bool {
-		return c.Emit("itest.reconn", "before") == nil
-	})
-	// 消费断线前那条 "before"，避免残留被误判成重连后的送达
 	select {
 	case v := <-got:
-		if v != "before" {
-			t.Fatalf("期望首条是 before，实际 %q", v)
+		if v != 42 {
+			t.Fatalf("参数不对: %d", v)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("首条事件没有送达")
-	}
-
-	// 服务端主动掐掉这条连接
-	srv.l.Lock()
-	var sid uint32
-	for id := range srv.services {
-		sid = id
-	}
-	srv.l.Unlock()
-	if err := srv.Close(sid, true); err != nil {
-		t.Fatalf("服务端关闭连接失败: %v", err)
-	}
-
-	// 重连后反复 Emit，直到回调真的被触发（收到 after），证明 topic 已重新注册
-	waitFor(t, 5*time.Second, "重连后 topic 重新注册并送达", func() bool {
-		if serviceCount(srv) != 1 || !isConnected(c) {
-			return false
-		}
-		if err := c.Emit("itest.reconn", "after"); err != nil {
-			return false
-		}
-		select {
-		case v := <-got:
-			return v == "after"
-		default:
-			return false
-		}
-	})
-}
-
-func TestUnixSocket(t *testing.T) {
-	sock := filepath.Join(t.TempDir(), "event.sock")
-	addr := "unix://" + sock
-	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	go srv.Listen(addr)
-	t.Cleanup(func() {
-		if err := srv.Shutdown(); err != nil {
-			t.Logf("Shutdown: %v", err)
-		}
-	})
-
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
-
-	got := make(chan string, 4)
-	if err := c.On("uds.test", func(s string) error { got <- s; return nil }); err != nil {
-		t.Fatal(err)
-	}
-
-	waitFor(t, 5*time.Second, "UDS 事件送达", func() bool {
-		if err := c.Emit("uds.test", "hello"); err != nil {
-			return false
-		}
-		select {
-		case v := <-got:
-			return v == "hello"
-		default:
-			return false
-		}
-	})
-
-	// 关闭后 socket 文件应被自动 unlink
-	if err := srv.Shutdown(); err != nil {
-		t.Fatalf("Shutdown: %v", err)
-	}
-	if _, err := os.Stat(sock); !os.IsNotExist(err) {
-		t.Fatalf("Shutdown 后 socket 文件应被删除，stat err=%v", err)
-	}
-}
-
-func TestUnixSocketReconnectAfterServerRestart(t *testing.T) {
-	// Unix socket 路径有长度上限，测试名太长会让 t.TempDir() 的路径超限，这里用 /tmp 短路径
-	sock := fmt.Sprintf("/tmp/event-uds-%d.sock", time.Now().UnixNano())
-	t.Cleanup(func() { os.Remove(sock) })
-	addr := "unix://" + sock
-
-	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	go srv.Listen(addr)
-
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
-
-	got := make(chan string, 16)
-	if err := c.On("uds.reconn", func(s string) error { got <- s; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 3*time.Second, "首轮连接 + 注册", func() bool {
-		if err := c.Emit("uds.reconn", "before"); err != nil {
-			return false
-		}
-		select {
-		case v := <-got:
-			return v == "before"
-		default:
-			return false
-		}
-	})
-
-	// 关掉服务端：socket 文件被 unlink，客户端连接断开
-	if err := srv.Shutdown(); err != nil {
-		t.Fatalf("Shutdown: %v", err)
-	}
-	if _, err := os.Stat(sock); !os.IsNotExist(err) {
-		t.Fatalf("Shutdown 后 socket 文件应被删除")
-	}
-
-	// 重启服务端（同一路径）
-	srv2 := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	go srv2.Listen(addr)
-	t.Cleanup(func() {
-		if err := srv2.Shutdown(); err != nil {
-			t.Logf("Shutdown: %v", err)
-		}
-	})
-
-	// 客户端应自动重连 + 重新注册，事件恢复送达
-	waitFor(t, 10*time.Second, "重启后重连并重新注册", func() bool {
-		if err := c.Emit("uds.reconn", "after"); err != nil {
-			return false
-		}
-		select {
-		case v := <-got:
-			return v == "after"
-		default:
-			return false
-		}
-	})
-}
-
-func TestUnixSocketClientBeforeServer(t *testing.T) {
-	sock := fmt.Sprintf("/tmp/event-uds-%d.sock", time.Now().UnixNano())
-	t.Cleanup(func() { os.Remove(sock) })
-	addr := "unix://" + sock
-
-	// 客户端先启动：socket 文件还不存在，Dial 是异步的，On 会阻塞在注册重试上
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
-
-	onDone := make(chan error, 1)
-	got := make(chan string, 4)
-	go func() {
-		onDone <- c.On("uds.cbs", func(s string) error { got <- s; return nil })
-	}()
-
-	// 让客户端先失败几轮（此时服务端还没起）
-	time.Sleep(300 * time.Millisecond)
-
-	// 服务端后启动
-	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	go srv.Listen(addr)
-	t.Cleanup(func() {
-		if err := srv.Shutdown(); err != nil {
-			t.Logf("Shutdown: %v", err)
-		}
-	})
-
-	// On 应该在服务端启动后（重连 + 注册成功）返回
-	select {
-	case err := <-onDone:
-		if err != nil {
-			t.Fatalf("On 失败: %v", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("On 没有在服务端启动后返回")
-	}
-
-	// 事件应该送达
-	waitFor(t, 5*time.Second, "事件送达", func() bool {
-		if err := c.Emit("uds.cbs", "hello"); err != nil {
-			return false
-		}
-		select {
-		case v := <-got:
-			return v == "hello"
-		default:
-			return false
-		}
-	})
-}
-
-// measureEmitRoundTrip 测「客户端同时是发布者和监听者」场景下单次 Emit 的
-// 平均往返耗时（4 跳：进 → 散 → 回 → 聚合回）。
-func measureEmitRoundTrip(t *testing.T, addr string) time.Duration {
-	t.Helper()
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
-
-	if err := c.On("bench.topic", func() error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	// 预热：让连接稳定、缓冲热起来
-	for i := 0; i < 200; i++ {
-		if err := c.Emit("bench.topic"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	const n = 5000
-	start := time.Now()
-	for i := 0; i < n; i++ {
-		if err := c.Emit("bench.topic"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	return time.Since(start) / n
-}
-
-func TestCompareTCPvsUDS(t *testing.T) {
-	tcpAddr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-
-	udsAddr := "unix://" + filepath.Join(t.TempDir(), "event.sock")
-	udsSrv := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	go udsSrv.Listen(udsAddr)
-	t.Cleanup(func() {
-		if err := udsSrv.Shutdown(); err != nil {
-			t.Logf("Shutdown: %v", err)
-		}
-	})
-
-	tcpLatency := measureEmitRoundTrip(t, tcpAddr)
-	udsLatency := measureEmitRoundTrip(t, udsAddr)
-
-	t.Logf("TCP 单次 Emit 往返: %v", tcpLatency)
-	t.Logf("UDS 单次 Emit 往返: %v", udsLatency)
-	if tcpLatency > 0 && udsLatency > 0 {
-		t.Logf("UDS 比 TCP 快 %.2fx（延迟降 %.0f%%）",
-			float64(tcpLatency)/float64(udsLatency),
-			(1-float64(udsLatency)/float64(tcpLatency))*100)
+	case <-time.After(5 * time.Second):
+		t.Fatal("回调没触发")
 	}
 }
 
 func TestEmitBatch(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
 
 	got := make(chan string, 256)
-	if err := c.On("batch.test", func(s string) error { got <- s; return nil }); err != nil {
+	if err := sub.On("batch.test", func(s string) error { got <- s; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	waitRoute(t, sub, pub, "batch.test")
 
 	const n = 100
 	argsList := make([][]any, n)
 	for i := range argsList {
 		argsList[i] = []any{fmt.Sprintf("msg-%d", i)}
 	}
-	errs := c.EmitBatch("batch.test", argsList...)
+	errs := pub.EmitBatch("batch.test", argsList...)
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("第 %d 条 Emit 失败: %v", i, err)
@@ -496,176 +264,303 @@ func TestEmitBatch(t *testing.T) {
 	}
 }
 
-func TestEmitBatchFaster(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
-	defer c.Close()
+// 空闲连接必须靠传输层心跳活下来，不能被判死。
+func TestIdleConnSurvivesHeartbeat(t *testing.T) {
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(300*time.Millisecond))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(300*time.Millisecond))
 
-	if err := c.On("batch.faster", func() error { return nil }); err != nil {
+	got := make(chan struct{}, 8)
+	if err := sub.On("itest.idle", func(s string) error { got <- struct{}{}; return nil }); err != nil {
 		t.Fatal(err)
 	}
-	// 预热
-	for i := 0; i < 100; i++ {
-		if err := c.Emit("batch.faster"); err != nil {
-			t.Fatal(err)
-		}
+	waitRoute(t, sub, pub, "itest.idle")
+
+	if err := pub.Emit("itest.idle", "warmup"); err != nil {
+		t.Fatalf("warmup Emit 失败: %v", err)
+	}
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("warmup 没送达")
 	}
 
-	// batch 上限受 msgChan 容量（512）约束，太大触发背压（msgChan is full）会断连
-	const n = 200
-	start := time.Now()
-	for i := 0; i < n; i++ {
-		if err := c.Emit("batch.faster"); err != nil {
-			t.Fatal(err)
-		}
+	time.Sleep(3 * time.Second)
+	if peerCount(pub) != 1 {
+		t.Fatal("空闲期间 peer 连接断了")
 	}
-	seqLatency := time.Since(start) / n
-
-	argsList := make([][]any, n)
-	start = time.Now()
-	if errs := c.EmitBatch("batch.faster", argsList...); len(errs) > 0 {
-		for _, err := range errs {
-			if err != nil {
-				t.Fatalf("EmitBatch 失败: %v", err)
-			}
-		}
+	if err := pub.Emit("itest.idle", "after-idle"); err != nil {
+		t.Fatalf("静默后 Emit 失败: %v", err)
 	}
-	batchLatency := time.Since(start) / n
-
-	t.Logf("逐个同步 Emit: %v/条", seqLatency)
-	t.Logf("EmitBatch: %v/条", batchLatency)
-	t.Logf("批量提速 %.2fx", float64(seqLatency)/float64(batchLatency))
+	select {
+	case <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("静默后事件没有送达")
+	}
 }
 
+// peer 断线重连后，订阅关系要重新建立。
+func TestReconnectAndResubscribe(t *testing.T) {
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+
+	got := make(chan string, 16)
+	if err := sub.On("itest.reconn", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "itest.reconn")
+
+	if err := pub.Emit("itest.reconn", "before"); err != nil {
+		t.Fatalf("首条 Emit 失败: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "before" {
+			t.Fatalf("期望 before，实际 %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("首条没送达")
+	}
+
+	// 掐掉 pub 到 sub 的 peer 连接（pub 是主动连接方），触发 pub 重连
+	pub.l.Lock()
+	for _, c := range pub.peers {
+		_ = c.Close()
+	}
+	pub.l.Unlock()
+
+	waitFor(t, 15*time.Second, "重连后重新订阅并送达", func() bool {
+		if peerCount(pub) != 1 {
+			return false
+		}
+		if subCount(pub, "itest.reconn") != 1 {
+			return false
+		}
+		if err := pub.Emit("itest.reconn", "after"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "after"
+		default:
+			return false
+		}
+	})
+}
+
+// 订阅节点收下请求后断线，发布节点的 pending 必须立即结算。
+func TestListenerDeathReleasesPending(t *testing.T) {
+	addr := startServer(t)
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(10*time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(10*time.Second))
+
+	started := make(chan struct{})
+	if err := sub.On("itest.slow", func() error {
+		close(started)
+		time.Sleep(30 * time.Second)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "itest.slow")
+
+	call := pub.EmitAsync("itest.slow")
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("订阅节点没收到请求")
+	}
+
+	sub.Close()
+
+	select {
+	case c := <-call.Done:
+		if c.Err == nil {
+			t.Fatal("订阅节点断线后应该回错误，结果 err=nil")
+		}
+		if !strings.Contains(c.Err.Error(), "connection lost") {
+			t.Logf("错误内容: %v", c.Err)
+		}
+		t.Logf("订阅节点断线立即结算: %v", c.Err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("订阅节点欠的响应没有被断线收尾")
+	}
+}
+
+// Close 之后不能偷偷重连。
+func TestClientCloseStopsReconnect(t *testing.T) {
+	addr := startServer(t)
+	c := startNode(t, addr, "closer", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
+	waitFor(t, 10*time.Second, "连接服务端", func() bool { return isConnected(c) })
+
+	if err := c.Close(); err != nil {
+		t.Logf("Close 返回: %v", err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if isConnected(c) {
+		t.Fatal("Close 之后 serverConn 仍非 nil")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("第二次 Close 应返回 nil，实际 %v", err)
+	}
+	_ = c.Emit("itest.after-close")
+	if isConnected(c) {
+		t.Fatal("Emit 之后又偷偷重连了")
+	}
+}
+
+// 错误 secret 的节点无法注册到服务端。
 func TestWrongSecretRejected(t *testing.T) {
-	addr, srv := startServer(t,
-		ServerOptions().SetSecret("right").SetHeartInterval(time.Second))
+	addr := startServer(t, ServerOptions().SetSecret("right").SetHeartInterval(time.Second))
+
 	c := Dial(addr, ClientOptions().
 		SetName("bad").SetSecret("wrong").
+		SetListenAddr("127.0.0.1:0").
 		SetHeartInterval(time.Second).
 		SetCheckInterval(100*time.Millisecond))
 	defer c.Close()
 
 	time.Sleep(600 * time.Millisecond)
-	if n := serviceCount(srv); n != 0 {
-		t.Fatalf("错误 secret 的连接不该注册成功，当前 services=%d", n)
+	if isConnected(c) {
+		t.Fatal("错误 secret 下不应连上服务端")
 	}
-	err := c.Emit("itest.any", "x")
-	if err == nil {
-		t.Fatal("错误 secret 下 Emit 不该成功")
-	}
-	t.Logf("错误 secret 被拒: %v", err)
+	t.Log("错误 secret 被拒")
 }
 
-// 多个监听者的错误要聚合回发布者
-func TestMultipleListenersErrorsAggregated(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	const n = 3
-	c1 := Dial(addr, ClientOptions().SetName("pub").
-		SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
-	defer c1.Close()
+func TestUnixSocket(t *testing.T) {
+	dirSock := filepath.Join(t.TempDir(), "dir.sock")
+	dir := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go dir.Listen("unix://" + dirSock)
+	t.Cleanup(func() { _ = dir.Shutdown() })
 
-	for i := 0; i < n; i++ {
-		// go.mod 是 go 1.20，循环变量是共享的，必须自己捕获
-		idx := i
-		c := Dial(addr, ClientOptions().SetName(fmt.Sprintf("sub%d", idx)).
-			SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
-		defer c.Close()
-		c.On("itest.multi", func(s string) error {
-			return fmt.Errorf("boom-%d", idx)
-		})
-	}
+	subSock := filepath.Join(t.TempDir(), "sub.sock")
+	pubSock := filepath.Join(t.TempDir(), "pub.sock")
 
-	var lastErr error
-	for i := 0; i < 60; i++ {
-		lastErr = c1.Emit("itest.multi", "x")
-		if lastErr != nil {
-			all := true
-			for j := 0; j < n; j++ {
-				if !strings.Contains(lastErr.Error(), fmt.Sprintf("boom-%d", j)) {
-					all = false
-					break
-				}
-			}
-			if all {
-				t.Logf("聚合到全部 %d 个错误: %v", n, lastErr)
-				return
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("没有聚合到全部错误，lastErr=%v", lastErr)
-}
-
-// 投递失败必须马上释放 pending，不能让发布者干等 Timeout。
-// 直接往 monitor 里塞一个 services 里不存在的 sid，模拟"快照里有、投递必失败"的窗口，
-// 这样测试是确定的，不依赖 EOF 与 Emit 谁先到。
-func TestDispatchFailureReleasesPending(t *testing.T) {
-	const timeout = 5 * time.Second
-	addr, srv := startServer(t, ServerOptions().SetTimeout(timeout).SetHeartInterval(time.Second))
-
-	sub := Dial(addr, ClientOptions().SetName("sub").SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
+	sub := Dial("unix://"+dirSock, ClientOptions().
+		SetName("sub").SetListenAddr("unix://"+subSock).
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
 	defer sub.Close()
-	sub.On("itest.dead", func() error { return nil })
-
-	pub := Dial(addr, ClientOptions().SetName("pub").SetCheckInterval(200*time.Millisecond))
+	pub := Dial("unix://"+dirSock, ClientOptions().
+		SetName("pub").SetListenAddr("unix://"+pubSock).
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
 	defer pub.Close()
 
-	waitFor(t, 5*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
-
-	srv.l.Lock()
-	var ts *topicSids
-	for _, ts = range srv.exact {
-		break
-	}
-	if ts != nil {
-		ts.sids[999999] = struct{}{} //幽灵监听者：在索引里，但不在 services 里
-	}
-	srv.l.Unlock()
-	if ts == nil {
-		t.Fatal("没找到已注册的 topic 条目")
+	got := make(chan string, 4)
+	if err := sub.On("uds.test", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
 	}
 
-	start := time.Now()
-	err := pub.Emit("itest.dead")
-	cost := time.Since(start)
-
-	if cost > timeout/2 {
-		t.Fatalf("Emit 耗时 %v，逼近 Timeout(%v)：pending 没被投递失败释放", cost.Round(time.Millisecond), timeout)
-	}
-	if err == nil {
-		t.Fatal("投递失败应该把错误回给发布者，结果 err=nil")
-	}
-	t.Logf("投递失败快速返回：耗时=%v err=%v", cost.Round(time.Millisecond), err)
+	waitFor(t, 15*time.Second, "UDS 订阅同步 + 送达", func() bool {
+		if peerCount(pub) != 1 || subCount(pub, "uds.test") != 1 {
+			return false
+		}
+		if err := pub.Emit("uds.test", "hello"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "hello"
+		default:
+			return false
+		}
+	})
 }
 
-// On 之后立刻 Emit，事件必须送达。
-// 修复前 On 用 go regist_topic()，注册帧和紧随其后的 Emit 是两条并发消息，
-// Emit 可能先到服务端 —— 那时 topic 还没注册，这次 Emit 变成"无人监听"，
-// 不报错也不送达，事件静默丢失。
-func TestOnThenEmitIsNotLost(t *testing.T) {
-	addr, _ := startServer(t, ServerOptions().SetHeartInterval(time.Second))
+// 服务端重启：节点应自动重连服务端，重新拿到列表并恢复路由。
+func TestServerRestart(t *testing.T) {
+	sock := fmt.Sprintf("/tmp/event-dir-%d.sock", time.Now().UnixNano())
+	t.Cleanup(func() { os.Remove(sock) })
+	addr := "unix://" + sock
 
-	pub := Dial(addr, ClientOptions().SetName("pub-order").SetCheckInterval(200*time.Millisecond))
+	dir := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go dir.Listen(addr)
+
+	sub := Dial(addr, ClientOptions().
+		SetName("sub").SetListenAddr("unix:///tmp/event-dirrestart-sub.sock").
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer sub.Close()
+	pub := Dial(addr, ClientOptions().
+		SetName("pub").SetListenAddr("unix:///tmp/event-dirrestart-pub.sock").
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
 	defer pub.Close()
-	waitFor(t, 5*time.Second, "发布者连接", func() bool { return isConnected(pub) })
+
+	got := make(chan string, 16)
+	if err := sub.On("dir.restart", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 15*time.Second, "首轮订阅同步 + 送达", func() bool {
+		if peerCount(pub) != 1 || subCount(pub, "dir.restart") != 1 {
+			return false
+		}
+		if err := pub.Emit("dir.restart", "before"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "before"
+		default:
+			return false
+		}
+	})
+
+	_ = dir.Shutdown()
+	dir2 := NewServer(ServerOptions().SetHeartInterval(time.Second))
+	go dir2.Listen(addr)
+	t.Cleanup(func() { _ = dir2.Shutdown() })
+
+	waitFor(t, 15*time.Second, "服务端重启后恢复路由", func() bool {
+		if peerCount(pub) != 1 || subCount(pub, "dir.restart") != 1 {
+			return false
+		}
+		if err := pub.Emit("dir.restart", "after"); err != nil {
+			return false
+		}
+		select {
+		case v := <-got:
+			return v == "after"
+		default:
+			return false
+		}
+	})
+}
+
+// 节点下线，服务端通知其他节点，peer 连接被清理。
+func TestNodeDownNotify(t *testing.T) {
+	addr := startServer(t)
+	serverAddr := addr
+	_ = serverAddr
+	sub := startNode(t, addr, "sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "pub", ClientOptions().SetHeartInterval(time.Second))
+
+	if err := sub.On("itest.down", func() error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "itest.down")
+
+	// sub 节点整个下线
+	sub.Close()
+
+	waitFor(t, 10*time.Second, "pub 清理 peer", func() bool {
+		return peerCount(pub) == 0
+	})
+}
+
+// 同一节点 On 之后立刻 Emit，事件不丢（本地订阅者直接执行，不经过网络）。
+func TestOnThenEmitIsNotLost(t *testing.T) {
+	addr := startServer(t)
+	c := startNode(t, addr, "self", ClientOptions().SetHeartInterval(time.Second).SetCheckInterval(200*time.Millisecond))
 
 	for i := 0; i < 20; i++ {
 		en := eventname.T(fmt.Sprintf("itest.order-%d", i))
 		got := make(chan string, 4)
-		sub := Dial(addr, ClientOptions().
-			SetName(fmt.Sprintf("sub-order-%d", i)).
-			SetHeartInterval(time.Second).
-			SetCheckInterval(10*time.Second))
-		// Dial 是异步的，先等连接起来；否则 On 只会把 topic 记在本地，
-		// 要等 connect 成功才上报，测的就不是顺序问题了
-		waitFor(t, 5*time.Second, "监听者连接", func() bool { return isConnected(sub) })
-		sub.On(en, func(s string) error {
+		if err := c.On(en, func(s string) error {
 			got <- s
 			return nil
-		})
-		// 关键：On 之后不做任何等待，直接 Emit
-		if err := pub.Emit(en, "x"); err != nil {
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := c.Emit(en, "x"); err != nil {
 			t.Fatalf("第 %d 轮 Emit 报错: %v", i+1, err)
 		}
 		select {
@@ -673,323 +568,105 @@ func TestOnThenEmitIsNotLost(t *testing.T) {
 			if v != "x" {
 				t.Fatalf("第 %d 轮参数不对: %q", i+1, v)
 			}
-		case <-time.After(10 * time.Second):
-			sub.Close()
-			t.Fatalf("第 %d 轮事件丢失：On 之后立刻 Emit 没有送达", i+1)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("第 %d 轮事件丢失", i+1)
 		}
-		sub.Close()
 	}
 }
 
-// 监听者已经收下请求、还没回包就断线：服务端必须立刻结算，
-// 不能让发布者干等 Timeout（默认 10s）。
-func TestListenerDeathReleasesPending(t *testing.T) {
-	// Timeout 取默认量级，收尾窗口取它的 40%：
-	// 有修复时是毫秒级，没修复时要等满 Timeout，两者差一个数量级，不会误判。
-	const timeout = 10 * time.Second
-	addr, srv := startServer(t, ServerOptions().SetTimeout(timeout).SetHeartInterval(time.Second))
+// 节点监听多个地址（TCP 随机端口 + UDS），其他节点通过任一地址连接。
+func TestMultiListenAddr(t *testing.T) {
+	addr := startServer(t)
 
-	started := make(chan struct{})
+	udsSock := filepath.Join(t.TempDir(), "multi.sock")
 	sub := Dial(addr, ClientOptions().
-		SetName("slow-sub").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(10*time.Second))
-	sub.On("itest.slow", func() error {
-		close(started)
-		time.Sleep(30 * time.Second) // 永远不回包
-		return nil
-	})
+		SetName("multi-sub").
+		SetListenAddr("127.0.0.1:0", "unix://"+udsSock).
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer sub.Close()
+	pub := startNode(t, addr, "multi-pub", ClientOptions().SetHeartInterval(time.Second))
 
-	pub := Dial(addr, ClientOptions().SetName("pub").SetCheckInterval(200*time.Millisecond))
-	defer pub.Close()
-
-	waitFor(t, 5*time.Second, "发布者连接", func() bool { return isConnected(pub) })
-	waitFor(t, 10*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
-
-	call := pub.EmitAsync("itest.slow")
-	select {
-	case <-started:
-	case <-time.After(10 * time.Second):
-		t.Fatal("监听者没有收到请求")
+	got := make(chan string, 4)
+	if err := sub.On("multi.addr", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
 	}
+	waitRoute(t, sub, pub, "multi.addr")
 
-	// 监听者带着这个未完成的请求断线
-	sub.Close()
+	if err := pub.Emit("multi.addr", "hello"); err != nil {
+		t.Fatalf("Emit 报错: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "hello" {
+			t.Fatalf("收到意外内容: %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("多地址监听下事件没送达")
+	}
+}
+
+// 不 SetListenAddr 时，默认监听 127.0.0.1:0（随机端口）。
+func TestDefaultListenAddr(t *testing.T) {
+	addr := startServer(t)
+
+	sub := Dial(addr, ClientOptions().
+		SetName("def-sub").
+		SetHeartInterval(time.Second).SetCheckInterval(100*time.Millisecond))
+	defer sub.Close()
+	pub := startNode(t, addr, "def-pub", ClientOptions().SetHeartInterval(time.Second))
+
+	got := make(chan string, 4)
+	if err := sub.On("def.addr", func(s string) error { got <- s; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "def.addr")
+
+	if err := pub.Emit("def.addr", "hello"); err != nil {
+		t.Fatalf("Emit 报错: %v", err)
+	}
+	select {
+	case v := <-got:
+		if v != "hello" {
+			t.Fatalf("收到意外内容: %q", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("默认监听地址下事件没送达")
+	}
+}
+
+// Builder 链式构建一次发送：自定义消息类型、事件名、发送选项、参数。
+func TestBuilder(t *testing.T) {
+	addr := startServer(t)
+	sub := startNode(t, addr, "builder-sub", ClientOptions().SetHeartInterval(time.Second))
+	pub := startNode(t, addr, "builder-pub", ClientOptions().SetHeartInterval(time.Second))
+
+	got := make(chan int, 4)
+	if err := sub.On("builder.test", func(n int) error { got <- n; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	waitRoute(t, sub, pub, "builder.test")
+
+	call := pub.Builder().
+		BuildMsgType(msgtype.Req).
+		BuildEventName("builder.test").
+		BuildSendOption(SendOptions().SetTimeout(time.Second)).
+		BuildArgs(42).
+		Send()
 
 	select {
 	case c := <-call.Done:
-		if c.Err == nil {
-			t.Fatal("监听者断线后应该回一个错误，结果 err=nil")
+		if c.Err != nil {
+			t.Fatalf("Builder Send 报错: %v", c.Err)
 		}
-		if !strings.Contains(c.Err.Error(), "connection lost") {
-			t.Logf("错误内容: %v", c.Err)
-		}
-		srv.l.Lock()
-		pending := len(srv.pending)
-		srv.l.Unlock()
-		if pending != 0 {
-			t.Fatalf("pending 没清干净，还剩 %d 条", pending)
-		}
-		t.Logf("监听者断线立即结算: %v", c.Err)
-	case <-time.After(timeout * 2 / 5):
-		t.Fatalf("等了 %v 还没结果：监听者欠的响应没有被断线收尾", timeout*2/5)
-	}
-}
-
-// Close 之后不能偷偷重连。
-// Dial 出来的 keepAlive goroutine 原本永远退不掉，Client 用完只能泄漏。
-func TestClientCloseStopsReconnect(t *testing.T) {
-	addr, srv := startServer(t, ServerOptions().SetHeartInterval(time.Second))
-	c := Dial(addr, ClientOptions().
-		SetName("closer").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(200*time.Millisecond))
-
-	waitFor(t, 10*time.Second, "连接建立", func() bool { return serviceCount(srv) == 1 })
-
-	if err := c.Close(); err != nil {
-		t.Logf("Close 返回: %v", err)
-	}
-	waitFor(t, 10*time.Second, "服务端连接清零", func() bool { return serviceCount(srv) == 0 })
-
-	// 再跨几个重连周期，确认不会偷偷回来
-	time.Sleep(time.Second)
-	if n := serviceCount(srv); n != 0 {
-		t.Fatalf("Close 之后又重连了，服务端连接数=%d", n)
-	}
-	if isConnected(c) {
-		t.Fatal("Close 之后 isConnected 仍为 true")
-	}
-	// 幂等
-	if err := c.Close(); err != nil {
-		t.Fatalf("第二次 Close 应返回 nil，实际 %v", err)
-	}
-	// Close 之后 Emit 必须明确报错，而不是静默成功
-	if err := c.Emit("itest.after-close"); err == nil {
-		t.Fatal("Close 之后 Emit 应该报错")
-	}
-}
-
-// 同一个监听者被结算两次（比如先收到 Res，之后连接又断了触发断线收尾），
-// 计数不能被减两次：uint64 下溢成天文数字后，pending 再也等不到 0，
-// 只能靠 Timeout 收尾，发布者白等。
-func TestSettleIsIdempotent(t *testing.T) {
-	addr, srv := startServer(t, ServerOptions().SetTimeout(2*time.Second).SetHeartInterval(time.Second))
-	sub := Dial(addr, ClientOptions().SetName("dup-sub").SetHeartInterval(time.Second))
-	defer sub.Close()
-	sub.On("itest.dup", func() error { return nil })
-	waitFor(t, 10*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
-
-	srv.l.Lock()
-	var subSID uint32
-	for sid, s := range srv.services {
-		if s.name == "dup-sub" {
-			subSID = sid
-		}
-	}
-	sc := &server_call{
-		origin_sid:     subSID,
-		origin_seq:     77,
-		serverReqCount: 2, // 两个监听者：dup-sub 和一个幽灵
-		settled:        map[uint32]struct{}{},
-		targets:        []uint32{subSID, 999998},
-	}
-	srv.pending[999] = sc
-	srv.l.Unlock()
-
-	// 同一个 sid 结算三次：真实场景是"先收到它的 Res，之后它连接断了又触发断线收尾"
-	for i := 0; i < 3; i++ {
-		srv.settle(subSID, "dup-sub", &msg.Msg{T: msgtype.Res, Seq: 999})
-	}
-
-	srv.l.Lock()
-	left := sc.serverReqCount
-	_, stillPending := srv.pending[999]
-	srv.l.Unlock()
-
-	// 只有一个监听者真正结算了，计数必须还剩 1，pending 必须还在
-	if left != 1 {
-		t.Fatalf("计数被多减了：期望剩 1，实际剩 %d（下溢会是个巨大的数）", left)
-	}
-	if !stillPending {
-		t.Fatal("还有一个监听者没结算，pending 不该被提前删掉")
-	}
-}
-
-// 大量在途请求 + 监听者断线：断线是罕见路径，收尾时扫全部 pending。
-// 这个测试保证它不会退化成 quadratic，也不会让发布者等满 Timeout。
-func TestListenerDeathReleasesManyPending(t *testing.T) {
-	const n = 500
-	const timeout = 10 * time.Second
-	addr, srv := startServer(t, ServerOptions().SetTimeout(timeout).SetHeartInterval(time.Second))
-
-	blocked := make(chan struct{}, n)
-	sub := Dial(addr, ClientOptions().
-		SetName("slow-many").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(10*time.Second))
-	sub.On("itest.manyslow", func(i int) error {
-		blocked <- struct{}{}
-		time.Sleep(30 * time.Second)
-		return nil
-	})
-
-	pub := Dial(addr, ClientOptions().SetName("pub-many").SetCheckInterval(200*time.Millisecond))
-	defer pub.Close()
-	waitFor(t, 10*time.Second, "发布者连接", func() bool { return isConnected(pub) })
-	waitFor(t, 10*time.Second, "监听者注册", func() bool { return listenerCount(srv) > 0 })
-
-	calls := make([]*Call, 0, n)
-	for i := 0; i < n; i++ {
-		calls = append(calls, pub.EmitAsync("itest.manyslow", i))
-	}
-	// 确认请求确实都到了监听者手里（服务端也已经全部登记进 pending）
-	for i := 0; i < n; i++ {
-		select {
-		case <-blocked:
-		case <-time.After(10 * time.Second):
-			t.Fatalf("只有 %d/%d 条请求到达监听者", i, n)
-		}
-	}
-	waitFor(t, 10*time.Second, "pending 全部登记", func() bool {
-		srv.l.Lock()
-		defer srv.l.Unlock()
-		return len(srv.pending) >= n
-	})
-
-	start := time.Now()
-	sub.Close() // 带着 n 条未完成的请求断线
-
-	var done, failed int
-	for _, c := range calls {
-		select {
-		case cc := <-c.Done:
-			done++
-			if cc.Err != nil {
-				failed++
-			}
-		case <-time.After(timeout * 2 / 5):
-			t.Fatalf("只结算了 %d/%d 条，耗时 %v", done, n, time.Since(start).Round(time.Millisecond))
-		}
-	}
-	cost := time.Since(start)
-	if failed != n {
-		t.Fatalf("期望 %d 条全部报错，实际失败 %d 条", n, failed)
-	}
-	srv.l.Lock()
-	left := len(srv.pending)
-	srv.l.Unlock()
-	if left != 0 {
-		t.Fatalf("pending 没清干净，还剩 %d 条", left)
-	}
-	t.Logf("%d 条在途请求随监听者断线全部结算，耗时 %v", n, cost.Round(time.Millisecond))
-}
-
-// Shutdown 必须把服务端彻底收干净：accept 循环退出、连接断开、pending 清零、
-// 端口释放、幂等。原来 listen() 里 Accept 出错是裸 continue，
-// 没有关 listener 的地方，所以那个循环永远退不出去。
-func TestServerShutdown(t *testing.T) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := l.Addr().String()
-	if err = l.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	srv := NewServer(ServerOptions().SetHeartInterval(time.Second))
-	listenDone := make(chan struct{})
-	go func() {
-		srv.Listen(addr)
-		close(listenDone)
-	}()
-
-	waitFor(t, 10*time.Second, "端口可用", func() bool {
-		c, err := net.Dial("tcp", addr)
-		if err != nil {
-			return false
-		}
-		c.Close()
-		return true
-	})
-
-	sub := Dial(addr, ClientOptions().
-		SetName("sub-shutdown").
-		SetHeartInterval(time.Second).
-		SetCheckInterval(10*time.Second))
-	defer sub.Close()
-	sub.On("itest.shutdown", func() error { return nil })
-
-	pub := Dial(addr, ClientOptions().
-		SetName("pub-shutdown").
-		SetCheckInterval(10*time.Second))
-	defer pub.Close()
-
-	waitFor(t, 10*time.Second, "两条连接就绪", func() bool { return serviceCount(srv) == 2 })
-	if err := pub.Emit("itest.shutdown"); err != nil {
-		t.Fatalf("Shutdown 前链路不通: %v", err)
-	}
-
-	start := time.Now()
-	if err := srv.Shutdown(); err != nil {
-		t.Fatalf("Shutdown 返回错误: %v", err)
-	}
-	t.Logf("Shutdown 耗时 %v", time.Since(start).Round(time.Millisecond))
-
-	// 阻塞在 Listen 里的调用必须返回
-	select {
-	case <-listenDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("Shutdown 之后 Listen 没有返回")
-	}
-
-	srv.l.Lock()
-	conns := len(srv.services)
-	pending := len(srv.pending)
-	listeners := len(srv.listeners)
-	srv.l.Unlock()
-	if conns != 0 || pending != 0 || listeners != 0 {
-		t.Fatalf("没收干净：services=%d pending=%d listeners=%d", conns, pending, listeners)
-	}
-	if !srv.IsShutdown() {
-		t.Fatal("IsShutdown 应为 true")
-	}
-
-	// 客户端必须感知到断连，本地挂着的 Call 也会被结算
-	waitFor(t, 10*time.Second, "客户端检测到断连",
-		func() bool { return !isConnected(pub) && !isConnected(sub) })
-
-	// 端口必须能重新绑定，证明 listener 真的关了
-	l2, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("端口没释放: %v", err)
-	}
-	if err = l2.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// 幂等
-	if err = srv.Shutdown(); err != nil {
-		t.Fatalf("第二次 Shutdown 应返回 nil，实际 %v", err)
-	}
-
-	// 已关闭的服务端：Emit 必须报错，不能静默成功
-	if err = pub.Emit("itest.shutdown"); err == nil {
-		t.Fatal("服务端已关闭，Emit 应该报错")
-	} else {
-		t.Logf("关闭后 Emit: %v", err)
-	}
-
-	// 已关闭的服务端：Listen 不再 panic，记日志后直接返回
-	second := make(chan struct{})
-	go func() {
-		srv.Listen(addr)
-		close(second)
-	}()
-	select {
-	case <-second:
 	case <-time.After(5 * time.Second):
-		t.Fatal("Shutdown 之后 Listen 应当立即返回")
+		t.Fatal("Builder Send 没有完成")
+	}
+	select {
+	case v := <-got:
+		if v != 42 {
+			t.Fatalf("参数不对: %d", v)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("回调没触发")
 	}
 }

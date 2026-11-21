@@ -35,6 +35,9 @@ func (this *builder) BuildArgs(args ...any) *builder {
 
 func (this *builder) Send() (call *Call) {
 	this.opt.mergeClientOption(this.client.opt)
+	if this.t == msgtype.Invalid {
+		this.t = msgtype.Req
+	}
 	call = this.client.emit_async(this.t, this.en, this.opt, this.args...)
 	return
 }

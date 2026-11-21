@@ -17,16 +17,27 @@ const (
 	ReqRandOne //请求,一堆多的情况下,默认响应最快的那个结果
 	Res        //响应
 	ResRandOne //响应
+	// 下面是 p2p 模式新增的消息类型，追加在末尾不影响已有取值。
+	Register    //节点注册（节点 → 目录），携带监听地址
+	RegisterRes //注册响应（目录 → 节点），携带当前节点列表
+	NodeDown    //节点下线通知（目录 → 节点）
+	Subscribe   //订阅广播（节点 → 节点）："我订阅了 X"
+	Unsubscribe //取消订阅广播（节点 → 节点）："我取消了订阅 X"
 )
 
 var m = [...]string{
-	Invalid:    "Invalid",
-	Verify:     "Verify",
-	On:         "On",
-	Req:        "Req",
-	ReqRandOne: "ReqRandOne",
-	Res:        "Res",
-	ResRandOne: "ResRandOne",
+	Invalid:     "Invalid",
+	Verify:      "Verify",
+	On:          "On",
+	Req:         "Req",
+	ReqRandOne:  "ReqRandOne",
+	Res:         "Res",
+	ResRandOne:  "ResRandOne",
+	Register:    "Register",
+	RegisterRes: "RegisterRes",
+	NodeDown:    "NodeDown",
+	Subscribe:   "Subscribe",
+	Unsubscribe: "Unsubscribe",
 }
 
 func (this T) String() string {

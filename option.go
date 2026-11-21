@@ -8,6 +8,7 @@ import (
 
 type ClientOption struct {
 	name           *string
+	listen_addrs   []string //节点自己的监听地址列表（可变），供其他节点连接。支持 unix:// 前缀和多个 ip:端口。
 	secret         *string
 	check_interval *time.Duration //链接检测,不能说断链了就马上去连,这会造成不必要的资源消耗。单位就是 time.Duration 本身,不要再乘 time.Second
 	is_wrap_error  *bool
@@ -25,6 +26,18 @@ func (this *ClientOption) SetName(name string) *ClientOption {
 		return this
 	}
 	this.name = &name
+	return this
+}
+
+// SetListenAddr 设置节点自己的监听地址（可变参数），供其他节点连接。
+// 支持 unix:// 前缀和多个 ip:端口，如 SetListenAddr(":9000", "unix:///tmp/n.sock")。
+// 不传参数时用默认值 "127.0.0.1:0"（系统分配随机空闲端口）。
+// 传 ":0" 也会回填实际分配到的端口注册到目录。
+func (this *ClientOption) SetListenAddr(addr ...string) *ClientOption {
+	if this == nil {
+		return this
+	}
+	this.listen_addrs = addr
 	return this
 }
 
@@ -94,6 +107,10 @@ func (this *ClientOption) merge(opt *ClientOption) {
 	this.connOption.merge(&opt.connOption)
 	if opt.name != nil {
 		this.name = opt.name
+	}
+
+	if opt.listen_addrs != nil {
+		this.listen_addrs = opt.listen_addrs
 	}
 
 	if opt.check_interval != nil {
